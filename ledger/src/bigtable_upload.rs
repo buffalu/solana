@@ -19,7 +19,7 @@ use {
 use solana_storage_bigtable::LedgerStorage;
 
 // Attempt to upload this many blocks in parallel
-const NUM_BLOCKS_TO_UPLOAD_IN_PARALLEL: usize = 64;
+const NUM_BLOCKS_TO_UPLOAD_IN_PARALLEL: usize = 32;
 
 // Read up to this many blocks from blockstore before blocking on the upload process
 const BLOCK_READ_AHEAD_DEPTH: usize = NUM_BLOCKS_TO_UPLOAD_IN_PARALLEL * 3;
@@ -158,7 +158,6 @@ pub async fn upload_confirmed_blocks(
                         Ok(confirmed_block) => {
                             info!("fetched block {} from blockstore, sending to other thread", slot);
                             sender.send((slot, Some(confirmed_block)))
-                            // Ok(())
                         }
                         Err(err) => {
                             warn!(
