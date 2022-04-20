@@ -1,4 +1,6 @@
 #![allow(clippy::integer_arithmetic)]
+
+use std::sync::Arc;
 use {
     crate::bigtable::RowKey,
     log::*,
@@ -274,17 +276,22 @@ impl From<Reward> for StoredConfirmedBlockReward {
 // A serialized `TransactionInfo` is stored in the `tx` table
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct TransactionInfo {
-    slot: Slot, // The slot that contains the block with this transaction in it
-    index: u32, // Where the transaction is located in the block
-    err: Option<TransactionError>, // None if the transaction executed successfully
+    slot: Slot,
+    // The slot that contains the block with this transaction in it
+    index: u32,
+    // Where the transaction is located in the block
+    err: Option<TransactionError>,
+    // None if the transaction executed successfully
     memo: Option<String>, // Transaction memo
 }
 
 // Part of a serialized `TransactionInfo` which is stored in the `tx` table
 #[derive(PartialEq, Debug)]
 struct UploadedTransaction {
-    slot: Slot, // The slot that contains the block with this transaction in it
-    index: u32, // Where the transaction is located in the block
+    slot: Slot,
+    // The slot that contains the block with this transaction in it
+    index: u32,
+    // Where the transaction is located in the block
     err: Option<TransactionError>, // None if the transaction executed successfully
 }
 
@@ -317,9 +324,12 @@ impl From<TransactionInfo> for TransactionStatus {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct LegacyTransactionByAddrInfo {
-    pub signature: Signature,          // The transaction signature
-    pub err: Option<TransactionError>, // None if the transaction executed successfully
-    pub index: u32,                    // Where the transaction is located in the block
+    pub signature: Signature,
+    // The transaction signature
+    pub err: Option<TransactionError>,
+    // None if the transaction executed successfully
+    pub index: u32,
+    // Where the transaction is located in the block
     pub memo: Option<String>,          // Transaction memo
 }
 
@@ -399,7 +409,7 @@ impl LedgerStorage {
     pub async fn get_confirmed_blocks_with_data<'a>(
         &self,
         slots: &'a [Slot],
-    ) -> Result<impl Iterator<Item = (Slot, ConfirmedBlockWithOptionalMetadata)> + 'a> {
+    ) -> Result<impl Iterator<Item=(Slot, ConfirmedBlockWithOptionalMetadata)> + 'a> {
         debug!(
             "LedgerStorage::get_confirmed_blocks_with_data request received: {:?}",
             slots
@@ -719,21 +729,33 @@ impl LedgerStorage {
             })
             .collect();
 
+        let mut tasks = vec![];
+
         if !tx_cells.is_empty() {
-            bytes_written += self
-                .connection
-                .put_bincode_cells_with_retry::<TransactionInfo>("tx", &tx_cells)
-                .await?;
+            let conn = Arc::new(self.connection.clone());
+            tasks.push(tokio::spawn(async move {
+                conn
+                    .put_bincode_cells_with_retry::<TransactionInfo>("tx", &tx_cells).await
+            }));
         }
 
         if !tx_by_addr_cells.is_empty() {
-            bytes_written += self
-                .connection
-                .put_protobuf_cells_with_retry::<tx_by_addr::TransactionByAddr>(
-                    "tx-by-addr",
-                    &tx_by_addr_cells,
-                )
-                .await?;
+            let conn = self.connection.clone();
+            tasks.push(tokio::spawn(async move {
+                conn
+                    .put_protobuf_cells_with_retry::<tx_by_addr::TransactionByAddr>(
+                        "tx-by-addr",
+                        &tx_by_addr_cells,
+                    ).await
+            }));
+        }
+
+        let results = futures::future::join_all(tasks).await;
+        let results: Vec<_> = results.into_iter().map(|r| r.unwrap()).collect();
+        let maybe_first_err = results.into_iter().find(|r| r.is_err());
+        if let Some(e) = maybe_first_err {
+            let err = e.unwrap_err();
+            return Err(Error::BigTableError(err));
         }
 
         let num_transactions = confirmed_block.transactions.len();
