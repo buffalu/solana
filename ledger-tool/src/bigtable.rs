@@ -1,4 +1,4 @@
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Runtime};
 /// The `bigtable` subcommand
 use {
     crate::ledger_path::canonicalize_ledger_path,
@@ -30,6 +30,7 @@ use {
 };
 
 async fn upload(
+    runtime: Arc<Runtime>,
     blockstore: Blockstore,
     starting_slot: Slot,
     ending_slot: Option<Slot>,
@@ -38,10 +39,9 @@ async fn upload(
     let bigtable = solana_storage_bigtable::LedgerStorage::new(false, None, None)
         .await
         .map_err(|err| format!("Failed to connect to storage: {:?}", err))?;
-    let rt = Builder::new_multi_thread().enable_all().build().unwrap();
 
     solana_ledger::bigtable_upload::upload_confirmed_blocks(
-        Arc::new(rt),
+        runtime,
         Arc::new(blockstore),
         bigtable,
         starting_slot,
@@ -494,7 +494,7 @@ impl BigTableSubCommand for App<'_, '_> {
 }
 
 pub fn bigtable_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
 
     let verbose = matches.is_present("verbose");
     let output_format = OutputFormat::from_matches(matches, "output_format", verbose);
@@ -511,6 +511,7 @@ pub fn bigtable_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) {
             );
 
             runtime.block_on(upload(
+                runtime.clone(),
                 blockstore,
                 starting_slot,
                 ending_slot,

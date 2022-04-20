@@ -1,3 +1,5 @@
+use crossbeam_channel::{bounded, unbounded};
+use itertools::Itertools;
 use tokio::runtime::Runtime;
 use {
     crate::blockstore::Blockstore,
@@ -17,10 +19,10 @@ use {
 use solana_storage_bigtable::LedgerStorage;
 
 // Attempt to upload this many blocks in parallel
-const NUM_BLOCKS_TO_UPLOAD_IN_PARALLEL: usize = 100;
+const NUM_BLOCKS_TO_UPLOAD_IN_PARALLEL: usize = 32;
 
 // Read up to this many blocks from blockstore before blocking on the upload process
-const BLOCK_READ_AHEAD_DEPTH: usize = NUM_BLOCKS_TO_UPLOAD_IN_PARALLEL * 4;
+const BLOCK_READ_AHEAD_DEPTH: usize = NUM_BLOCKS_TO_UPLOAD_IN_PARALLEL * 3;
 
 pub async fn upload_confirmed_blocks(
     runtime: Arc<Runtime>,
@@ -57,7 +59,7 @@ pub async fn upload_confirmed_blocks(
             "Ledger has no slots from {} to {:?}",
             starting_slot, ending_slot
         )
-        .into());
+            .into());
     }
 
     info!(
@@ -129,42 +131,39 @@ pub async fn upload_confirmed_blocks(
     );
 
     // Load the blocks out of blockstore in a separate thread to allow for concurrent block uploading
-    let (_loader_thread, receiver) = {
+    let (_loader_threads, receiver): (Vec<_>, _) = {
         let exit = exit.clone();
 
-        let (sender, receiver) = std::sync::mpsc::sync_channel(BLOCK_READ_AHEAD_DEPTH);
-        (
-            std::thread::spawn(move || {
-                let mut measure = Measure::start("block loader thread");
-                for (i, slot) in blocks_to_upload.iter().enumerate() {
-                    if exit.load(Ordering::Relaxed) {
-                        break;
-                    }
+        let (sender, receiver) = bounded(BLOCK_READ_AHEAD_DEPTH);
 
-                    let _ = match blockstore.get_rooted_block(*slot, true) {
-                        Ok(confirmed_block) => sender.send((*slot, Some(confirmed_block))),
+        let (slot_tx, slot_rx) = unbounded();
+        let _ = blocks_to_upload.into_iter().for_each(|b| slot_tx.send(b).unwrap());
+        ((0..16).map(|_| {
+            let blockstore = blockstore.clone();
+            let sender = sender.clone();
+            let slot_rx = slot_rx.clone();
+
+            std::thread::spawn(move || {
+                loop {
+                    let slot = slot_rx.recv().unwrap();
+                    let _ = match blockstore.get_rooted_block(slot, true) {
+                        Ok(confirmed_block) => {
+                            info!("fetched block {} from blockstore, sending to other thread", slot);
+                            sender.send((slot, Some(confirmed_block)))
+                            // Ok(())
+                        }
                         Err(err) => {
                             warn!(
-                                "Failed to get load confirmed block from slot {}: {:?}",
-                                slot, err
-                            );
-                            sender.send((*slot, None))
+                                    "Failed to get load confirmed block from slot {}: {:?}",
+                                    slot, err
+                                );
+                            sender.send((slot, None))
                         }
                     };
-
-                    if i > 0 && i % NUM_BLOCKS_TO_UPLOAD_IN_PARALLEL == 0 {
-                        info!(
-                            "{}% of blocks processed ({}/{})",
-                            i * 100 / blocks_to_upload.len(),
-                            i,
-                            blocks_to_upload.len()
-                        );
-                    }
                 }
-                measure.stop();
-                info!("{} to load {} blocks", measure, blocks_to_upload.len());
-            }),
-            receiver,
+            })
+        }).collect(),
+         receiver
         )
     };
 
@@ -190,7 +189,8 @@ pub async fn upload_confirmed_blocks(
             }
             Some(confirmed_block) => {
                 let bt = bigtable.clone();
-                Some(runtime.spawn(async move { bt.upload_confirmed_block(slot, confirmed_block).await })) },
+                Some(runtime.spawn(async move { bt.upload_confirmed_block(slot, confirmed_block).await }))
+            }
         });
 
         for result in futures::future::join_all(uploads).await {
