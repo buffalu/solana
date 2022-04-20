@@ -68,6 +68,7 @@ impl BigTableUploadService {
             }
 
             let result = runtime.block_on(bigtable_upload::upload_confirmed_blocks(
+                runtime.clone(),
                 blockstore.clone(),
                 bigtable_ledger_storage.clone(),
                 start_slot,

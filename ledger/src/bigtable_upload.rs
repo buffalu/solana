@@ -1,3 +1,4 @@
+use tokio::runtime::Runtime;
 use {
     crate::blockstore::Blockstore,
     log::*,
@@ -13,14 +14,16 @@ use {
         time::Duration,
     },
 };
+use solana_storage_bigtable::LedgerStorage;
 
 // Attempt to upload this many blocks in parallel
-const NUM_BLOCKS_TO_UPLOAD_IN_PARALLEL: usize = 32;
+const NUM_BLOCKS_TO_UPLOAD_IN_PARALLEL: usize = 100;
 
 // Read up to this many blocks from blockstore before blocking on the upload process
-const BLOCK_READ_AHEAD_DEPTH: usize = NUM_BLOCKS_TO_UPLOAD_IN_PARALLEL * 2;
+const BLOCK_READ_AHEAD_DEPTH: usize = NUM_BLOCKS_TO_UPLOAD_IN_PARALLEL * 4;
 
 pub async fn upload_confirmed_blocks(
+    runtime: Arc<Runtime>,
     blockstore: Arc<Blockstore>,
     bigtable: solana_storage_bigtable::LedgerStorage,
     starting_slot: Slot,
@@ -185,7 +188,9 @@ pub async fn upload_confirmed_blocks(
                 num_blocks -= 1;
                 None
             }
-            Some(confirmed_block) => Some(bigtable.upload_confirmed_block(slot, confirmed_block)),
+            Some(confirmed_block) => {
+                let bt = bigtable.clone();
+                Some(runtime.spawn(async move { bt.upload_confirmed_block(slot, confirmed_block).await })) },
         });
 
         for result in futures::future::join_all(uploads).await {

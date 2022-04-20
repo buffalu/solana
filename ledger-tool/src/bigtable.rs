@@ -1,3 +1,4 @@
+use tokio::runtime::Builder;
 /// The `bigtable` subcommand
 use {
     crate::ledger_path::canonicalize_ledger_path,
@@ -37,8 +38,10 @@ async fn upload(
     let bigtable = solana_storage_bigtable::LedgerStorage::new(false, None, None)
         .await
         .map_err(|err| format!("Failed to connect to storage: {:?}", err))?;
+    let rt = Builder::new_multi_thread().enable_all().build().unwrap();
 
     solana_ledger::bigtable_upload::upload_confirmed_blocks(
+        Arc::new(rt),
         Arc::new(blockstore),
         bigtable,
         starting_slot,
