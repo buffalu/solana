@@ -148,6 +148,7 @@ where
     let bank = bank_forks.read().unwrap().get(slot);
     if let Some(bank) = bank {
         let results = bank_method(&bank, params);
+        // TODO (LB): here?
         let mut w_last_notified_slot = subscription.last_notified_slot.write().unwrap();
         let (filter_results, result_slot) =
             filter_results(results, params, *w_last_notified_slot, bank);

@@ -101,6 +101,7 @@ impl FetchStage {
             }
         }
 
+        // TODO (LB): do we want to drop here?
         if poh_recorder
             .lock()
             .unwrap()

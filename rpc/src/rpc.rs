@@ -1017,6 +1017,7 @@ impl JsonRpcRequestProcessor {
             check_is_at_least_confirmed(commitment)?;
 
             // Block is old enough to be finalized
+            // TODO (LB): lock here too?
             if slot
                 <= self
                     .block_commitment_cache
@@ -1244,6 +1245,7 @@ impl JsonRpcRequestProcessor {
         if slot == 0 {
             return Ok(Some(self.genesis_creation_time()));
         }
+        // TODO (LB): lock thing here?
         if slot
             <= self
                 .block_commitment_cache
@@ -1265,6 +1267,7 @@ impl JsonRpcRequestProcessor {
             self.check_slot_cleaned_up(&result, slot)?;
             Ok(result.ok().unwrap_or(None))
         } else {
+            // TODO (LB): lock thing here?
             let r_bank_forks = self.bank_forks.read().unwrap();
             if let Some(bank) = r_bank_forks.get(slot) {
                 Ok(Some(bank.clock().unix_timestamp))
