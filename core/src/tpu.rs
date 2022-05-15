@@ -14,6 +14,7 @@ use {
         sigverify::TransactionSigVerifier,
         sigverify_stage::SigVerifyStage,
         staked_nodes_updater_service::StakedNodesUpdaterService,
+        transaction_scheduler::TransactionScheduler,
     },
     crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError},
     solana_gossip::cluster_info::ClusterInfo,
@@ -66,6 +67,7 @@ pub struct Tpu {
     find_packet_sender_stake_stage: FindPacketSenderStakeStage,
     vote_find_packet_sender_stake_stage: FindPacketSenderStakeStage,
     staked_nodes_updater_service: StakedNodesUpdaterService,
+    transaction_scheduler: TransactionScheduler,
 }
 
 impl Tpu {
@@ -199,6 +201,12 @@ impl Tpu {
             cluster_confirmed_slot_sender,
         );
 
+        let transaction_scheduler = TransactionScheduler::new(
+            verified_receiver.clone(),
+            verified_tpu_vote_packets_receiver.clone(),
+            verified_gossip_vote_packets_receiver.clone(),
+        );
+
         let banking_stage = BankingStage::new(
             cluster_info,
             poh_recorder,
@@ -232,6 +240,7 @@ impl Tpu {
             find_packet_sender_stake_stage,
             vote_find_packet_sender_stake_stage,
             staked_nodes_updater_service,
+            transaction_scheduler,
         }
     }
 
@@ -261,6 +270,7 @@ impl Tpu {
             self.find_packet_sender_stake_stage.join(),
             self.vote_find_packet_sender_stake_stage.join(),
             self.staked_nodes_updater_service.join(),
+            self.transaction_scheduler.join(),
         ];
         self.tpu_quic_t.join()?;
         let broadcast_result = self.broadcast_stage.join();
