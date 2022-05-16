@@ -3,7 +3,8 @@
 //! - TPU vote transactions
 //! - Gossip vote transactions
 
-use std::sync::Arc;
+use solana_runtime::accounts::AccountLocks;
+use std::sync::{Arc, Mutex};
 use {
     crate::unprocessed_packet_batches::{self, UnprocessedPacketBatches},
     crossbeam_channel::{select, unbounded, Receiver, Sender},
@@ -26,26 +27,37 @@ pub struct SchedulerRequest {
     response_sender: Sender<SchedulerResponse>,
 }
 
+#[derive(Clone)]
+pub struct ScheduledBatch {}
+
+#[derive(Clone)]
+pub struct Pong {
+    id: usize,
+}
+
 pub enum SchedulerResponse {
-    RequestBatch { batch: Vec<usize> },
-    Ping { id: usize },
+    ScheduledBatch(ScheduledBatch),
+    Pong(Pong),
 }
 
 impl SchedulerResponse {
-    fn ping(&self) -> usize {
+    fn pong(self) -> Pong {
         match self {
-            SchedulerResponse::RequestBatch { .. } => {
+            SchedulerResponse::ScheduledBatch { .. } => {
                 unreachable!("invalid response expected");
             }
-            SchedulerResponse::Ping { id } => *id,
+            SchedulerResponse::Pong(pong) => pong,
         }
     }
 }
 
 pub enum SchedulerStage {
-    TX,
-    TPU_VOTE,
-    GOSSIP,
+    // normal transactions
+    Transactions,
+    // votes coming in on tpu port
+    TpuVotes,
+    // gossip votes
+    GossipVotes,
 }
 
 pub struct TransactionScheduler {
@@ -60,18 +72,22 @@ pub struct TransactionScheduler {
 }
 
 impl TransactionScheduler {
-    /// Creates an event loop and channel so external threads can communicate with each scheduler.
+    /// Creates a thread for each type of transaction and a handle to the event loop.
     pub fn new(
         verified_receiver: Receiver<Vec<PacketBatch>>,
         verified_tpu_vote_packets_receiver: Receiver<Vec<PacketBatch>>,
         verified_gossip_vote_packets_receiver: Receiver<Vec<PacketBatch>>,
         exit: Arc<AtomicBool>,
     ) -> Self {
+        // keep track of account locking here too? TODO (LB): remove
+        let scheduled_accounts = Arc::new(Mutex::new(AccountLocks::default()));
+
         let (tx_scheduler_request_sender, tx_scheduler_request_receiver) = unbounded();
         let tx_request_handler_thread = Self::start_event_loop(
             "tx_scheduler_insertion_thread",
             tx_scheduler_request_receiver,
             verified_receiver,
+            scheduled_accounts.clone(),
             &exit,
         );
 
@@ -80,6 +96,7 @@ impl TransactionScheduler {
             "tpu_vote_scheduler_tx_insertion_thread",
             tpu_vote_scheduler_request_receiver,
             verified_tpu_vote_packets_receiver,
+            scheduled_accounts.clone(),
             &exit,
         );
 
@@ -89,6 +106,7 @@ impl TransactionScheduler {
             "gossip_vote_scheduler_tx_insertion_thread",
             gossip_vote_scheduler_request_receiver,
             verified_gossip_vote_packets_receiver,
+            scheduled_accounts.clone(),
             &exit,
         );
 
@@ -109,6 +127,7 @@ impl TransactionScheduler {
         t_name: &str,
         scheduler_request_receiver: Receiver<SchedulerRequest>,
         packet_receiver: Receiver<Vec<PacketBatch>>,
+        scheduled_accounts: Arc<Mutex<AccountLocks>>,
         exit: &Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let exit = exit.clone();
@@ -132,7 +151,7 @@ impl TransactionScheduler {
                         recv(scheduler_request_receiver) -> maybe_batch_request => {
                             match maybe_batch_request {
                                 Ok(batch_request) => {
-                                    Self::handle_scheduler_request(&mut unprocessed_packet_batches, batch_request)
+                                    Self::handle_scheduler_request(&mut unprocessed_packet_batches, &scheduled_accounts, batch_request);
                                 }
                                 Err(_) => {
                                     break;
@@ -152,16 +171,19 @@ impl TransactionScheduler {
 
     /// Handles scheduler requests and sends back a response over the channel
     fn handle_scheduler_request(
-        _unprocessed_packets: &mut UnprocessedPacketBatches,
+        unprocessed_packets: &mut UnprocessedPacketBatches,
+        scheduled_accounts: &Arc<Mutex<AccountLocks>>,
         scheduler_request: SchedulerRequest,
     ) {
         let response_sender = scheduler_request.response_sender;
 
         match scheduler_request.msg {
-            SchedulerMessage::RequestBatch { .. } => {}
+            SchedulerMessage::RequestBatch { num_txs } => {
+                let unprocessed = unprocessed_packets.pop_max_n(num_txs).unwrap_or_default();
+            }
             SchedulerMessage::Ping { id } => {
                 let _ = response_sender
-                    .send(SchedulerResponse::Ping { id })
+                    .send(SchedulerResponse::Pong(Pong { id }))
                     .unwrap();
             }
         }
@@ -190,15 +212,16 @@ impl TransactionScheduler {
         info!("dropped {} transactions", number_of_dropped_packets);
     }
 
+    /// Returns sending side of the channel given the scheduler stage
     pub fn get_sender_from_stage(&self, stage: SchedulerStage) -> &Sender<SchedulerRequest> {
         match stage {
-            SchedulerStage::TX => &self.tx_scheduler_request_sender,
-            SchedulerStage::TPU_VOTE => &self.tpu_vote_scheduler_request_sender,
-            SchedulerStage::GOSSIP => &self.gossip_vote_scheduler_request_sender,
+            SchedulerStage::Transactions => &self.tx_scheduler_request_sender,
+            SchedulerStage::TpuVotes => &self.tpu_vote_scheduler_request_sender,
+            SchedulerStage::GossipVotes => &self.gossip_vote_scheduler_request_sender,
         }
     }
 
-    /// Requests a batch
+    /// Requests a batch of num_txs transactions from one of the scheduler stages.
     pub fn request_batch(&self, stage: SchedulerStage, num_txs: usize) -> SchedulerResponse {
         Self::make_scheduler_request(
             self.get_sender_from_stage(stage),
@@ -206,8 +229,8 @@ impl TransactionScheduler {
         )
     }
 
-    /// Ping-pong the thread
-    pub fn request_ping(&self, stage: SchedulerStage, id: usize) -> SchedulerResponse {
+    /// Ping-pong a scheduler stage
+    pub fn send_ping(&self, stage: SchedulerStage, id: usize) -> SchedulerResponse {
         Self::make_scheduler_request(
             self.get_sender_from_stage(stage),
             SchedulerMessage::Ping { id },
@@ -229,6 +252,7 @@ impl TransactionScheduler {
         response_receiver.recv().unwrap()
     }
 
+    /// Clean up the threads
     pub fn join(self) -> thread::Result<()> {
         self.tx_request_handler_thread.join()?;
         self.tpu_vote_request_handler_thread.join()?;
@@ -256,10 +280,22 @@ mod tests {
             TransactionScheduler::new(tx_receiver, tpu_vote_receiver, gossip_vote_receiver, exit);
 
         // check alive
-        assert_eq!(scheduler.request_ping(SchedulerStage::TX, 1).ping(), 1);
-        assert_eq!(scheduler.request_ping(SchedulerStage::GOSSIP, 2).ping(), 2);
         assert_eq!(
-            scheduler.request_ping(SchedulerStage::TPU_VOTE, 3).ping(),
+            scheduler
+                .send_ping(SchedulerStage::Transactions, 1)
+                .pong()
+                .id,
+            1
+        );
+        assert_eq!(
+            scheduler
+                .send_ping(SchedulerStage::GossipVotes, 2)
+                .pong()
+                .id,
+            2
+        );
+        assert_eq!(
+            scheduler.send_ping(SchedulerStage::TpuVotes, 3).pong().id,
             3
         );
 
@@ -285,10 +321,22 @@ mod tests {
         );
 
         // check alive
-        assert_eq!(scheduler.request_ping(SchedulerStage::TX, 1).ping(), 1);
-        assert_eq!(scheduler.request_ping(SchedulerStage::GOSSIP, 2).ping(), 2);
         assert_eq!(
-            scheduler.request_ping(SchedulerStage::TPU_VOTE, 3).ping(),
+            scheduler
+                .send_ping(SchedulerStage::Transactions, 1)
+                .pong()
+                .id,
+            1
+        );
+        assert_eq!(
+            scheduler
+                .send_ping(SchedulerStage::GossipVotes, 2)
+                .pong()
+                .id,
+            2
+        );
+        assert_eq!(
+            scheduler.send_ping(SchedulerStage::TpuVotes, 3).pong().id,
             3
         );
 
@@ -317,13 +365,21 @@ mod tests {
         );
 
         // make sure thread is awake by pinging and waiting for response
-        assert_eq!(scheduler.request_ping(SchedulerStage::TX, 1).ping(), 1);
+        assert_eq!(
+            scheduler
+                .send_ping(SchedulerStage::Transactions, 1)
+                .pong()
+                .id,
+            1
+        );
 
-        // now test latency
-        let now = Instant::now();
-        let _ = scheduler.request_ping(SchedulerStage::TX, 1);
-        let elapsed = now.elapsed();
-        info!("elapsed: {:?}", elapsed);
+        for _ in 0..1000 {
+            // now test latency
+            let now = Instant::now();
+            let _ = scheduler.send_ping(SchedulerStage::Transactions, 1).pong();
+            let elapsed = now.elapsed();
+            info!("elapsed: {:?}", elapsed);
+        }
 
         drop(tx_sender);
         drop(tpu_vote_sender);
