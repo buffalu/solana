@@ -18,7 +18,7 @@ use {
 
 pub enum SchedulerMessage {
     RequestBatch { num_txs: usize },
-    Ping {},
+    Ping { id: usize },
 }
 
 pub struct SchedulerRequest {
@@ -28,7 +28,18 @@ pub struct SchedulerRequest {
 
 pub enum SchedulerResponse {
     RequestBatch { batch: Vec<usize> },
-    Ping {},
+    Ping { id: usize },
+}
+
+impl SchedulerResponse {
+    fn ping(&self) -> usize {
+        match self {
+            SchedulerResponse::RequestBatch { .. } => {
+                unreachable!("invalid response expected");
+            }
+            SchedulerResponse::Ping { id } => *id,
+        }
+    }
 }
 
 pub struct TransactionScheduler {
@@ -142,8 +153,10 @@ impl TransactionScheduler {
 
         match scheduler_request.msg {
             SchedulerMessage::RequestBatch { .. } => {}
-            SchedulerMessage::Ping {} => {
-                let _ = response_sender.send(SchedulerResponse::Ping {}).unwrap();
+            SchedulerMessage::Ping { id } => {
+                let _ = response_sender
+                    .send(SchedulerResponse::Ping { id })
+                    .unwrap();
             }
         }
     }
@@ -195,21 +208,27 @@ impl TransactionScheduler {
         )
     }
 
-    pub fn ping_tx(&self) -> SchedulerResponse {
-        Self::make_scheduler_request(&self.tx_scheduler_request_sender, SchedulerMessage::Ping {})
-    }
-
-    pub fn ping_tpu_vote(&self) -> SchedulerResponse {
+    #[cfg(test)]
+    pub fn ping_tx(&self, id: usize) -> SchedulerResponse {
         Self::make_scheduler_request(
-            &self.tpu_vote_scheduler_request_sender,
-            SchedulerMessage::Ping {},
+            &self.tx_scheduler_request_sender,
+            SchedulerMessage::Ping { id },
         )
     }
 
-    pub fn ping_gossip_vote(&self) -> SchedulerResponse {
+    #[cfg(test)]
+    pub fn ping_tpu_vote(&self, id: usize) -> SchedulerResponse {
+        Self::make_scheduler_request(
+            &self.tpu_vote_scheduler_request_sender,
+            SchedulerMessage::Ping { id },
+        )
+    }
+
+    #[cfg(test)]
+    pub fn ping_gossip_vote(&self, id: usize) -> SchedulerResponse {
         Self::make_scheduler_request(
             &self.gossip_vote_scheduler_request_sender,
-            SchedulerMessage::Ping {},
+            SchedulerMessage::Ping { id },
         )
     }
 
@@ -254,9 +273,9 @@ mod tests {
             TransactionScheduler::new(tx_receiver, tpu_vote_receiver, gossip_vote_receiver, exit);
 
         // check alive
-        let _ = scheduler.ping_tx();
-        let _ = scheduler.ping_gossip_vote();
-        let _ = scheduler.ping_tpu_vote();
+        assert_eq!(scheduler.ping_tx(1).ping(), 1);
+        assert_eq!(scheduler.ping_gossip_vote(2).ping(), 2);
+        assert_eq!(scheduler.ping_tpu_vote(3).ping(), 3);
 
         drop(tx_sender);
         drop(tpu_vote_sender);
@@ -280,9 +299,9 @@ mod tests {
         );
 
         // check alive
-        let _ = scheduler.ping_tx();
-        let _ = scheduler.ping_gossip_vote();
-        let _ = scheduler.ping_tpu_vote();
+        assert_eq!(scheduler.ping_tx(1).ping(), 1);
+        assert_eq!(scheduler.ping_gossip_vote(2).ping(), 2);
+        assert_eq!(scheduler.ping_tpu_vote(3).ping(), 3);
 
         exit.store(true, Ordering::Relaxed);
 
