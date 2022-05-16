@@ -314,6 +314,8 @@ mod tests {
 
     #[test]
     fn test_duration() {
+        solana_logger::setup_with_default("info");
+
         let (tx_sender, tx_receiver) = unbounded();
         let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
         let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
@@ -326,9 +328,14 @@ mod tests {
             exit.clone(),
         );
 
+        // make sure thread is awake by pinging and waiting for response
+        let _ = scheduler.ping_tx(1).ping();
+
+        // now test latency
         let now = Instant::now();
-        let response = scheduler.ping_tx(1).ping();
+        let _ = scheduler.ping_tx(1).ping();
         let elapsed = now.elapsed();
+        info!("elapsed: {:?}", elapsed);
 
         drop(tx_sender);
         drop(tpu_vote_sender);
