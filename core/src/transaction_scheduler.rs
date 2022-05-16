@@ -261,6 +261,7 @@ mod tests {
     use crossbeam_channel::unbounded;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::Instant;
 
     #[test]
     fn test_start_and_join_channel_dropped() {
@@ -309,5 +310,29 @@ mod tests {
         drop(tx_sender);
         drop(tpu_vote_sender);
         drop(gossip_vote_sender);
+    }
+
+    #[test]
+    fn test_duration() {
+        let (tx_sender, tx_receiver) = unbounded();
+        let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
+        let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
+        let exit = Arc::new(AtomicBool::new(false));
+
+        let scheduler = TransactionScheduler::new(
+            tx_receiver,
+            tpu_vote_receiver,
+            gossip_vote_receiver,
+            exit.clone(),
+        );
+
+        let now = Instant::now();
+        let response = scheduler.ping_tx(1).ping();
+        let elapsed = now.elapsed();
+
+        drop(tx_sender);
+        drop(tpu_vote_sender);
+        drop(gossip_vote_sender);
+        assert_matches!(scheduler.join(), Ok(()));
     }
 }
