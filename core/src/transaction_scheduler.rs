@@ -42,6 +42,12 @@ impl SchedulerResponse {
     }
 }
 
+pub enum SchedulerStage {
+    TX,
+    TPU_VOTE,
+    GOSSIP,
+}
+
 pub struct TransactionScheduler {
     tx_request_handler_thread: JoinHandle<()>,
     tx_scheduler_request_sender: Sender<SchedulerRequest>,
@@ -184,50 +190,26 @@ impl TransactionScheduler {
         info!("dropped {} transactions", number_of_dropped_packets);
     }
 
-    /// Requests a batch containing up to num_txs transactions
-    pub fn request_tx_batch(self, num_txs: usize) -> SchedulerResponse {
+    pub fn get_sender_from_stage(&self, stage: SchedulerStage) -> &Sender<SchedulerRequest> {
+        match stage {
+            SchedulerStage::TX => &self.tx_scheduler_request_sender,
+            SchedulerStage::TPU_VOTE => &self.tpu_vote_scheduler_request_sender,
+            SchedulerStage::GOSSIP => &self.gossip_vote_scheduler_request_sender,
+        }
+    }
+
+    /// Requests a batch
+    pub fn request_batch(&self, stage: SchedulerStage, num_txs: usize) -> SchedulerResponse {
         Self::make_scheduler_request(
-            &self.tx_scheduler_request_sender,
+            self.get_sender_from_stage(stage),
             SchedulerMessage::RequestBatch { num_txs },
         )
     }
 
-    /// Requests a batch containing up to num_txs vote transactions from the tpu_vote port
-    pub fn request_tpu_vote_batch(self, num_txs: usize) -> SchedulerResponse {
+    /// Ping-pong the thread
+    pub fn request_ping(&self, stage: SchedulerStage, id: usize) -> SchedulerResponse {
         Self::make_scheduler_request(
-            &self.tpu_vote_scheduler_request_sender,
-            SchedulerMessage::RequestBatch { num_txs },
-        )
-    }
-
-    /// Requests a batch containing up to num_txs vote transactions from gossip
-    pub fn request_gossip_vote_batch(self, num_txs: usize) -> SchedulerResponse {
-        Self::make_scheduler_request(
-            &self.gossip_vote_scheduler_request_sender,
-            SchedulerMessage::RequestBatch { num_txs },
-        )
-    }
-
-    #[cfg(test)]
-    pub fn ping_tx(&self, id: usize) -> SchedulerResponse {
-        Self::make_scheduler_request(
-            &self.tx_scheduler_request_sender,
-            SchedulerMessage::Ping { id },
-        )
-    }
-
-    #[cfg(test)]
-    pub fn ping_tpu_vote(&self, id: usize) -> SchedulerResponse {
-        Self::make_scheduler_request(
-            &self.tpu_vote_scheduler_request_sender,
-            SchedulerMessage::Ping { id },
-        )
-    }
-
-    #[cfg(test)]
-    pub fn ping_gossip_vote(&self, id: usize) -> SchedulerResponse {
-        Self::make_scheduler_request(
-            &self.gossip_vote_scheduler_request_sender,
+            self.get_sender_from_stage(stage),
             SchedulerMessage::Ping { id },
         )
     }
@@ -257,7 +239,7 @@ impl TransactionScheduler {
 
 #[cfg(test)]
 mod tests {
-    use crate::transaction_scheduler::TransactionScheduler;
+    use crate::transaction_scheduler::{SchedulerStage, TransactionScheduler};
     use crossbeam_channel::unbounded;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -274,9 +256,12 @@ mod tests {
             TransactionScheduler::new(tx_receiver, tpu_vote_receiver, gossip_vote_receiver, exit);
 
         // check alive
-        assert_eq!(scheduler.ping_tx(1).ping(), 1);
-        assert_eq!(scheduler.ping_gossip_vote(2).ping(), 2);
-        assert_eq!(scheduler.ping_tpu_vote(3).ping(), 3);
+        assert_eq!(scheduler.request_ping(SchedulerStage::TX, 1).ping(), 1);
+        assert_eq!(scheduler.request_ping(SchedulerStage::GOSSIP, 2).ping(), 2);
+        assert_eq!(
+            scheduler.request_ping(SchedulerStage::TPU_VOTE, 3).ping(),
+            3
+        );
 
         drop(tx_sender);
         drop(tpu_vote_sender);
@@ -300,9 +285,12 @@ mod tests {
         );
 
         // check alive
-        assert_eq!(scheduler.ping_tx(1).ping(), 1);
-        assert_eq!(scheduler.ping_gossip_vote(2).ping(), 2);
-        assert_eq!(scheduler.ping_tpu_vote(3).ping(), 3);
+        assert_eq!(scheduler.request_ping(SchedulerStage::TX, 1).ping(), 1);
+        assert_eq!(scheduler.request_ping(SchedulerStage::GOSSIP, 2).ping(), 2);
+        assert_eq!(
+            scheduler.request_ping(SchedulerStage::TPU_VOTE, 3).ping(),
+            3
+        );
 
         exit.store(true, Ordering::Relaxed);
 
@@ -329,11 +317,11 @@ mod tests {
         );
 
         // make sure thread is awake by pinging and waiting for response
-        let _ = scheduler.ping_tx(1).ping();
+        assert_eq!(scheduler.request_ping(SchedulerStage::TX, 1).ping(), 1);
 
         // now test latency
         let now = Instant::now();
-        let _ = scheduler.ping_tx(1).ping();
+        let _ = scheduler.request_ping(SchedulerStage::TX, 1);
         let elapsed = now.elapsed();
         info!("elapsed: {:?}", elapsed);
 
