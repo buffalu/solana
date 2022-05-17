@@ -206,6 +206,7 @@ impl Tpu {
             verified_tpu_vote_packets_receiver.clone(),
             verified_gossip_vote_packets_receiver.clone(),
             exit.clone(),
+            cost_model.clone(),
         );
 
         let banking_stage = BankingStage::new(
