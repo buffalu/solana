@@ -151,7 +151,6 @@ impl TransactionScheduler {
         exit: Arc<AtomicBool>,
         cost_model: Arc<RwLock<CostModel>>,
     ) -> Self {
-        // keep track of account locking here too? TODO (LB): remove
         let scheduled_accounts = Arc::new(Mutex::new(AccountLocks::default()));
 
         let (tx_scheduler_request_sender, tx_scheduler_request_receiver) = unbounded();
@@ -252,7 +251,6 @@ impl TransactionScheduler {
             msg,
             response_sender,
         };
-        // TODO (LB): don't unwrap
         let _ = request_sender.send(request).unwrap();
         response_receiver.recv().unwrap()
     }
@@ -347,7 +345,6 @@ impl TransactionScheduler {
             let mut scheduled_accounts_l = scheduled_accounts.lock().unwrap();
             // NOTE: as soon at these accounts are locked, must ensure that they're unlocked or
             // those accounts will never get scheduled
-            // TODO: clone hacky AF
             // TODO: might wanna rearrange some of this to avoid long lock time.
             let account_locks = sanitized_tx
                 .get_account_locks(&bank.feature_set)
@@ -594,7 +591,7 @@ impl TransactionScheduler {
                     }
                     trace!("dropped account locks, account_locks: {:?}", account_locks);
                 }
-                // TODO (LB): reschedule transactions
+                // TODO (LB): reschedule transactions as packet
                 // for tx in rescheduled_transactions {
                 //     unprocessed_packets.push(tx.deser)
                 // }
