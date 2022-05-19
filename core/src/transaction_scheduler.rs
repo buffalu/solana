@@ -744,114 +744,114 @@ mod tests {
         },
     };
 
-    // #[test]
-    // fn test_start_and_join_channel_dropped() {
-    //     let (tx_sender, tx_receiver) = unbounded();
-    //     let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
-    //     let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
-    //     let exit = Arc::new(AtomicBool::new(false));
-    //     let cost_model = Arc::new(RwLock::new(CostModel::default()));
-    //
-    //     let scheduler = TransactionScheduler::new(
-    //         tx_receiver,
-    //         tpu_vote_receiver,
-    //         gossip_vote_receiver,
-    //         exit,
-    //         cost_model,
-    //     );
-    //
-    //     // check alive
-    //     assert_eq!(scheduler.send_ping(SchedulerStage::Transactions, 1).id, 1);
-    //     assert_eq!(scheduler.send_ping(SchedulerStage::GossipVotes, 2).id, 2);
-    //     assert_eq!(scheduler.send_ping(SchedulerStage::TpuVotes, 3).id, 3);
-    //
-    //     drop(tx_sender);
-    //     drop(tpu_vote_sender);
-    //     drop(gossip_vote_sender);
-    //
-    //     assert_matches!(scheduler.join(), Ok(()));
-    // }
-    //
-    // #[test]
-    // fn test_start_and_join_channel_exit_signal() {
-    //     let (tx_sender, tx_receiver) = unbounded();
-    //     let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
-    //     let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
-    //     let exit = Arc::new(AtomicBool::new(false));
-    //
-    //     let cost_model = Arc::new(RwLock::new(CostModel::default()));
-    //
-    //     let scheduler = TransactionScheduler::new(
-    //         tx_receiver,
-    //         tpu_vote_receiver,
-    //         gossip_vote_receiver,
-    //         exit.clone(),
-    //         cost_model,
-    //     );
-    //
-    //     // check alive
-    //     assert_eq!(scheduler.send_ping(SchedulerStage::Transactions, 1).id, 1);
-    //     assert_eq!(scheduler.send_ping(SchedulerStage::GossipVotes, 2).id, 2);
-    //     assert_eq!(scheduler.send_ping(SchedulerStage::TpuVotes, 3).id, 3);
-    //
-    //     exit.store(true, Ordering::Relaxed);
-    //
-    //     assert_matches!(scheduler.join(), Ok(()));
-    //     drop(tx_sender);
-    //     drop(tpu_vote_sender);
-    //     drop(gossip_vote_sender);
-    // }
-    //
-    // #[test]
-    // fn test_single_tx() {
-    //     solana_logger::setup_with_default("trace");
-    //     let (tx_sender, tx_receiver) = unbounded();
-    //     let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
-    //     let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
-    //     let exit = Arc::new(AtomicBool::new(false));
-    //     let cost_model = Arc::new(RwLock::new(CostModel::default()));
-    //     let bank = Arc::new(Bank::default_for_tests());
-    //
-    //     let accounts = get_random_accounts();
-    //
-    //     let scheduler = TransactionScheduler::new(
-    //         tx_receiver,
-    //         tpu_vote_receiver,
-    //         gossip_vote_receiver,
-    //         exit.clone(),
-    //         cost_model,
-    //     );
-    //
-    //     // main logic
-    //     {
-    //         let tx = get_tx(&[get_account_meta(&accounts, "A", true)], 200);
-    //
-    //         send_transactions(&[&tx], &tx_sender);
-    //
-    //         // should probably have gotten the packet by now
-    //         let _ = scheduler.send_ping(SchedulerStage::Transactions, 1);
-    //
-    //         // make sure the requested batch is the single packet
-    //         let mut batch = scheduler.request_batch(SchedulerStage::Transactions, 1, &bank);
-    //         assert_eq!(batch.sanitized_transactions.len(), 1);
-    //         assert_eq!(
-    //             batch.sanitized_transactions.pop().unwrap().signature(),
-    //             &tx.signatures[0]
-    //         );
-    //
-    //         // make sure the batch is unlocked
-    //         let _ = scheduler.send_batch_execution_update(
-    //             SchedulerStage::Transactions,
-    //             batch.sanitized_transactions,
-    //             vec![],
-    //         );
-    //     }
-    //
-    //     drop(tx_sender);
-    //     drop(tpu_vote_sender);
-    //     drop(gossip_vote_sender);
-    //     assert_matches!(scheduler.join(), Ok(()));
-    // }
+    #[test]
+    fn test_start_and_join_channel_dropped() {
+        let (tx_sender, tx_receiver) = unbounded();
+        let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
+        let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
+        let exit = Arc::new(AtomicBool::new(false));
+        let cost_model = Arc::new(RwLock::new(CostModel::default()));
+
+        let scheduler = TransactionScheduler::new(
+            tx_receiver,
+            tpu_vote_receiver,
+            gossip_vote_receiver,
+            exit,
+            cost_model,
+        );
+
+        // check alive
+        assert_eq!(scheduler.send_ping(SchedulerStage::Transactions, 1).id, 1);
+        assert_eq!(scheduler.send_ping(SchedulerStage::GossipVotes, 2).id, 2);
+        assert_eq!(scheduler.send_ping(SchedulerStage::TpuVotes, 3).id, 3);
+
+        drop(tx_sender);
+        drop(tpu_vote_sender);
+        drop(gossip_vote_sender);
+
+        assert_matches!(scheduler.join(), Ok(()));
+    }
+
+    #[test]
+    fn test_start_and_join_channel_exit_signal() {
+        let (tx_sender, tx_receiver) = unbounded();
+        let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
+        let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
+        let exit = Arc::new(AtomicBool::new(false));
+
+        let cost_model = Arc::new(RwLock::new(CostModel::default()));
+
+        let scheduler = TransactionScheduler::new(
+            tx_receiver,
+            tpu_vote_receiver,
+            gossip_vote_receiver,
+            exit.clone(),
+            cost_model,
+        );
+
+        // check alive
+        assert_eq!(scheduler.send_ping(SchedulerStage::Transactions, 1).id, 1);
+        assert_eq!(scheduler.send_ping(SchedulerStage::GossipVotes, 2).id, 2);
+        assert_eq!(scheduler.send_ping(SchedulerStage::TpuVotes, 3).id, 3);
+
+        exit.store(true, Ordering::Relaxed);
+
+        assert_matches!(scheduler.join(), Ok(()));
+        drop(tx_sender);
+        drop(tpu_vote_sender);
+        drop(gossip_vote_sender);
+    }
+
+    #[test]
+    fn test_single_tx() {
+        solana_logger::setup_with_default("trace");
+        let (tx_sender, tx_receiver) = unbounded();
+        let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
+        let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
+        let exit = Arc::new(AtomicBool::new(false));
+        let cost_model = Arc::new(RwLock::new(CostModel::default()));
+        let bank = Arc::new(Bank::default_for_tests());
+
+        let accounts = get_random_accounts();
+
+        let scheduler = TransactionScheduler::new(
+            tx_receiver,
+            tpu_vote_receiver,
+            gossip_vote_receiver,
+            exit.clone(),
+            cost_model,
+        );
+
+        // main logic
+        {
+            let tx = get_tx(&[get_account_meta(&accounts, "A", true)], 200);
+
+            send_transactions(&[&tx], &tx_sender);
+
+            // should probably have gotten the packet by now
+            let _ = scheduler.send_ping(SchedulerStage::Transactions, 1);
+
+            // make sure the requested batch is the single packet
+            let mut batch = scheduler.request_batch(SchedulerStage::Transactions, 1, &bank);
+            assert_eq!(batch.sanitized_transactions.len(), 1);
+            assert_eq!(
+                batch.sanitized_transactions.pop().unwrap().signature(),
+                &tx.signatures[0]
+            );
+
+            // make sure the batch is unlocked
+            let _ = scheduler.send_batch_execution_update(
+                SchedulerStage::Transactions,
+                batch.sanitized_transactions,
+                vec![],
+            );
+        }
+
+        drop(tx_sender);
+        drop(tpu_vote_sender);
+        drop(gossip_vote_sender);
+        assert_matches!(scheduler.join(), Ok(()));
+    }
 
     #[test]
     fn test_conflicting_transactions() {
