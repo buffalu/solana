@@ -284,9 +284,6 @@ impl TransactionScheduler {
             .spawn(move || {
                 let mut unprocessed_packet_batches = UnprocessedPacketBatches::with_capacity(700_000);
 
-                // hashmap representing the highest fee of currently write-locked blocked accounts
-                let mut highest_wl_blocked_account_fees = HashMap::with_capacity(20_000);
-
                 loop {
                     select! {
                         recv(packet_receiver) -> maybe_packet_batches => {
@@ -303,7 +300,7 @@ impl TransactionScheduler {
                             match maybe_batch_request {
                                 Ok(batch_request) => {
                                     // rescheduled txs might get big, so allocated outside of this fn
-                                    Self::handle_scheduler_request(&mut unprocessed_packet_batches, &scheduled_accounts, batch_request, &mut highest_wl_blocked_account_fees);
+                                    Self::handle_scheduler_request(&mut unprocessed_packet_batches, &scheduled_accounts, batch_request);
                                 }
                                 Err(_) => {
                                     break;
@@ -414,25 +411,6 @@ impl TransactionScheduler {
                 return Err(e);
             }
 
-            // Assuming it can be scheduled in a parallel manner and everything else ok, remove any fees
-            for acc in account_locks
-                .writable
-                .iter()
-                .chain(account_locks.readonly.iter())
-            {
-                match highest_wl_blocked_account_fees.entry(**acc) {
-                    Entry::Occupied(blocked_fee) => {
-                        if priority >= *blocked_fee.get() {
-                            blocked_fee.remove();
-                        }
-                    }
-                    Entry::Vacant(_) => {}
-                }
-            }
-            trace!(
-                "updated blocked_account_fees: {:?}",
-                highest_wl_blocked_account_fees
-            );
             trace!("updated scheduled_accounts: {:?}", scheduled_accounts_l);
 
             Ok(sanitized_tx)
@@ -460,7 +438,7 @@ impl TransactionScheduler {
     }
 
     fn check_higher_payer_than_blocked_accounts(
-        blocked_account_fees: &mut HashMap<Pubkey, u64>,
+        blocked_account_fees: &HashMap<Pubkey, u64>,
         writable_keys: &[&Pubkey],
         readonly_keys: &[&Pubkey],
         fee_per_cu: u64,
@@ -478,18 +456,20 @@ impl TransactionScheduler {
     fn get_scheduled_batch(
         unprocessed_packets: &mut UnprocessedPacketBatches,
         scheduled_accounts: &Arc<Mutex<AccountLocks>>,
-        highest_wl_blocked_account_fees: &mut HashMap<Pubkey, u64>,
         num_txs: usize,
         bank: &Arc<Bank>,
     ) -> (Vec<SanitizedTransaction>, Vec<DeserializedPacket>) {
         let mut sanitized_transactions = Vec::new();
         let mut rescheduled_packets = Vec::new();
 
+        // hashmap representing the highest fee of currently write-locked blocked accounts
+        let mut highest_wl_blocked_account_fees = HashMap::with_capacity(20_000);
+
         while let Some(deserialized_packet) = unprocessed_packets.pop_max() {
             match Self::try_schedule(
                 &deserialized_packet,
                 bank,
-                highest_wl_blocked_account_fees,
+                &mut highest_wl_blocked_account_fees,
                 scheduled_accounts,
             ) {
                 Ok(sanitized_tx) => {
@@ -534,7 +514,6 @@ impl TransactionScheduler {
         unprocessed_packets: &mut UnprocessedPacketBatches,
         scheduled_accounts: &Arc<Mutex<AccountLocks>>,
         scheduler_request: SchedulerRequest,
-        highest_wl_blocked_account_fees: &mut HashMap<Pubkey, u64>,
     ) {
         let response_sender = scheduler_request.response_sender;
         match scheduler_request.msg {
@@ -543,7 +522,6 @@ impl TransactionScheduler {
                 let (sanitized_transactions, rescheduled_packets) = Self::get_scheduled_batch(
                     unprocessed_packets,
                     scheduled_accounts,
-                    highest_wl_blocked_account_fees,
                     num_txs,
                     &bank,
                 );
@@ -718,28 +696,27 @@ impl TransactionScheduler {
 
 #[cfg(test)]
 mod tests {
-    use crossbeam_channel::Sender;
-    use solana_runtime::bank::Bank;
-    use solana_sdk::compute_budget::ComputeBudgetInstruction;
-    use solana_sdk::instruction::AccountMeta;
-    use solana_sdk::pubkey::Pubkey;
-    use std::collections::HashMap;
     use {
         crate::transaction_scheduler::{SchedulerStage, TransactionScheduler},
-        crossbeam_channel::unbounded,
+        crossbeam_channel::{unbounded, Sender},
         solana_perf::packet::PacketBatch,
-        solana_runtime::cost_model::CostModel,
+        solana_runtime::{bank::Bank, cost_model::CostModel},
         solana_sdk::{
+            compute_budget::ComputeBudgetInstruction,
             hash::Hash,
-            instruction::Instruction,
+            instruction::{AccountMeta, Instruction},
             packet::Packet,
+            pubkey::Pubkey,
             signature::{Keypair, Signer},
             system_program,
             transaction::Transaction,
         },
-        std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc, RwLock,
+        std::{
+            collections::HashMap,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc, RwLock,
+            },
         },
     };
 
