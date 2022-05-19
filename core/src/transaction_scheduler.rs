@@ -718,7 +718,9 @@ impl TransactionScheduler {
 #[cfg(test)]
 mod tests {
     use solana_runtime::bank::Bank;
+    use solana_sdk::compute_budget::ComputeBudgetInstruction;
     use solana_sdk::instruction::AccountMeta;
+    use solana_sdk::pubkey::Pubkey;
     use {
         crate::transaction_scheduler::{SchedulerStage, TransactionScheduler},
         crossbeam_channel::unbounded,
@@ -858,5 +860,10 @@ mod tests {
         drop(tpu_vote_sender);
         drop(gossip_vote_sender);
         assert_matches!(scheduler.join(), Ok(()));
+    }
+
+    fn build_tx(account_metas: &[AccountMeta], fee_per_cu: u64) -> Transaction {
+        let kp = Keypair::new();
+        Transaction::new_signed_with_payer(&[ComputeBudgetInstruction::set_prioritization_fee()])
     }
 }
