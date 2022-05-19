@@ -90,7 +90,7 @@ impl AccountLocks {
         })
     }
 
-    fn unlock_readonly(&mut self, key: &Pubkey) {
+    pub fn unlock_readonly(&mut self, key: &Pubkey) {
         if let hash_map::Entry::Occupied(mut occupied_entry) = self.readonly_locks.entry(*key) {
             let count = occupied_entry.get_mut();
             *count -= 1;
@@ -100,7 +100,7 @@ impl AccountLocks {
         }
     }
 
-    fn unlock_write(&mut self, key: &Pubkey) {
+    pub fn unlock_write(&mut self, key: &Pubkey) {
         self.write_locks.remove(key);
     }
 }

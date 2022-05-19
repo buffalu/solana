@@ -13,12 +13,8 @@ use {
     },
     crossbeam_channel::{select, unbounded, Receiver, Sender},
     solana_perf::packet::PacketBatch,
-    solana_runtime::{
-        accounts::AccountLocks, bank::Bank, cost_model::CostModel,
-        transaction_error_metrics::TransactionErrorMetrics,
-    },
+    solana_runtime::{accounts::AccountLocks, bank::Bank, cost_model::CostModel},
     solana_sdk::{
-        clock::MAX_PROCESSING_AGE,
         feature_set,
         pubkey::Pubkey,
         transaction::{
@@ -48,6 +44,7 @@ pub enum SchedulerMessage {
     },
     ExecutedBatchUpdate {
         executed_transactions: Vec<SanitizedTransaction>,
+        rescheduled_transactions: Vec<SanitizedTransaction>,
     },
 }
 
@@ -68,9 +65,7 @@ pub struct Pong {
 }
 
 #[derive(Clone)]
-pub struct ExecutedBatchResponse {
-    sanitized_transactions: Vec<SanitizedTransaction>,
-}
+pub struct ExecutedBatchResponse {}
 
 pub enum SchedulerResponse {
     ScheduledBatch(ScheduledBatch),
@@ -232,11 +227,13 @@ impl TransactionScheduler {
         &self,
         stage: SchedulerStage,
         executed_transactions: Vec<SanitizedTransaction>,
+        rescheduled_transactions: Vec<SanitizedTransaction>,
     ) -> ExecutedBatchResponse {
         Self::make_scheduler_request(
             self.get_sender_from_stage(stage),
             SchedulerMessage::ExecutedBatchUpdate {
                 executed_transactions,
+                rescheduled_transactions,
             },
         )
         .executed_batch_response()
@@ -349,10 +346,18 @@ impl TransactionScheduler {
             // those accounts will never get scheduled
             // TODO: clone hacky AF
             // TODO: might wanna rearrange some of this to avoid long lock time.
-            let foo = sanitized_tx.clone();
-            let account_locks = foo
+            let account_locks = sanitized_tx
                 .get_account_locks(&bank.feature_set)
                 .map_err(|e| SchedulerError::InvalidTransactionFormat(e))?;
+
+            trace!("blocked_account_fees: {:?}", blocked_account_fees);
+
+            trace!(
+                "tx fee: {}, readable: {:?}, writeable: {:?}",
+                fee_per_cu,
+                account_locks.readonly,
+                account_locks.writable
+            );
 
             // Make sure that this transaction isn't blocked on another transaction that has a higher
             // fee for one of its accounts
@@ -362,6 +367,10 @@ impl TransactionScheduler {
                 &account_locks.readonly,
                 fee_per_cu,
             ) {
+                trace!(
+                    "account is blocked by another blocked account, upsert account fee block: {}",
+                    fee_per_cu
+                );
                 Self::upsert_higher_fee_account_lock(
                     &account_locks,
                     blocked_account_fees,
@@ -370,10 +379,9 @@ impl TransactionScheduler {
                 return Err(e);
             }
 
-            let mut sanitized_txs = vec![sanitized_tx];
+            // let mut sanitized_txs = vec![sanitized_tx];
             // let lock_results = vec![Ok(())];
             // let mut error_counters = TransactionErrorMetrics::default();
-
             // ensure that the tx
             // let tx_results = bank.check_transactions(
             //     &sanitized_txs,
@@ -391,6 +399,10 @@ impl TransactionScheduler {
                 &account_locks.writable,
                 &account_locks.readonly,
             ) {
+                trace!(
+                    "account is blocked by an executing tx, upsert account fee block: {}",
+                    fee_per_cu
+                );
                 Self::upsert_higher_fee_account_lock(
                     &account_locks,
                     blocked_account_fees,
@@ -398,7 +410,25 @@ impl TransactionScheduler {
                 );
                 return Err(e);
             }
-            Ok(sanitized_txs.pop().unwrap())
+
+            // Assuming it can be scheduled in a parallel manner and everything else ok, remove any fees
+            for acc in account_locks
+                .writable
+                .iter()
+                .chain(account_locks.readonly.iter())
+            {
+                match blocked_account_fees.entry(**acc) {
+                    Entry::Occupied(blocked_fee) => {
+                        if fee_per_cu >= *blocked_fee.get() {
+                            blocked_fee.remove();
+                        }
+                    }
+                    Entry::Vacant(_) => {}
+                }
+            }
+            trace!("updated blocked_account_fees: {:?}", blocked_account_fees);
+
+            Ok(sanitized_tx)
         }
     }
 
@@ -434,7 +464,7 @@ impl TransactionScheduler {
     ) -> Result<()> {
         for acc in writable_keys.iter().chain(readonly_keys.iter()) {
             if let Some(blocked_fee) = blocked_account_fees.get(acc) {
-                if blocked_fee >= &fee_per_cu {
+                if blocked_fee > &fee_per_cu {
                     return Err(SchedulerError::AccountBlocked(**acc));
                 }
             }
@@ -533,16 +563,38 @@ impl TransactionScheduler {
                 }
             }
             SchedulerMessage::Ping { id } => {
-                trace!("SchedulerMessage::Ping: {}", id);
                 let _ = response_sender
                     .send(SchedulerResponse::Pong(Pong { id }))
                     .unwrap();
             }
             SchedulerMessage::ExecutedBatchUpdate {
-                executed_transactions: _,
+                executed_transactions,
+                rescheduled_transactions,
             } => {
-                trace!("SchedulerMessage::ExecutedBatchUpdate");
-                // todo: unlock from highest_blocked_account_fees?
+                {
+                    // drop account locks
+                    let mut account_locks = scheduled_accounts.lock().unwrap();
+                    for tx in executed_transactions
+                        .iter()
+                        .chain(rescheduled_transactions.iter())
+                    {
+                        let tx_locks = tx.get_account_locks_unchecked();
+                        Self::drop_account_locks(
+                            &mut account_locks,
+                            &tx_locks.writable,
+                            &tx_locks.readonly,
+                        );
+                    }
+                }
+                // TODO (LB): reschedule transactions
+                // for tx in rescheduled_transactions {
+                //     unprocessed_packets.push(tx.deser)
+                // }
+                let _ = response_sender
+                    .send(SchedulerResponse::ExecutedBatchResponse(
+                        ExecutedBatchResponse {},
+                    ))
+                    .unwrap();
             }
         }
     }
@@ -586,6 +638,20 @@ impl TransactionScheduler {
         }
 
         Ok(())
+    }
+
+    /// NOTE: this is copied from accounts.rs
+    fn drop_account_locks(
+        account_locks: &mut AccountLocks,
+        writable_keys: &[&Pubkey],
+        readonly_keys: &[&Pubkey],
+    ) {
+        for k in writable_keys {
+            account_locks.unlock_write(k);
+        }
+        for k in readonly_keys {
+            account_locks.unlock_readonly(k);
+        }
     }
 
     fn transaction_from_deserialized_packet(
@@ -632,9 +698,10 @@ impl TransactionScheduler {
             num_added += packet_indexes.len();
         }
         trace!(
-            "added {}, dropped {} transactions",
+            "new packets: added {}, dropped {}, total: {}",
             num_added,
-            number_of_dropped_packets
+            number_of_dropped_packets,
+            unprocessed_packets.len()
         );
     }
 
@@ -779,6 +846,12 @@ mod tests {
         assert_eq!(
             batch.sanitized_transactions.pop().unwrap().signature(),
             &tx0.signatures[0]
+        );
+
+        let _ = scheduler.send_batch_execution_update(
+            SchedulerStage::Transactions,
+            batch.sanitized_transactions,
+            vec![],
         );
 
         drop(tx_sender);
