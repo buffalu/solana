@@ -286,8 +286,8 @@ impl TransactionScheduler {
             .spawn(move || {
                 let mut unprocessed_packet_batches = UnprocessedPacketBatches::with_capacity(700_000);
 
-                // hashmap representing the highest fee of currently blocked accounts
-                let mut highest_blocked_account_fees = HashMap::with_capacity(20_000);
+                // hashmap representing the highest fee of currently write-locked blocked accounts
+                let mut highest_wl_blocked_account_fees = HashMap::with_capacity(20_000);
 
                 loop {
                     select! {
@@ -305,7 +305,7 @@ impl TransactionScheduler {
                             match maybe_batch_request {
                                 Ok(batch_request) => {
                                     // rescheduled txs might get big, so allocated outside of this fn
-                                    Self::handle_scheduler_request(&mut unprocessed_packet_batches, &scheduled_accounts, batch_request, &mut highest_blocked_account_fees);
+                                    Self::handle_scheduler_request(&mut unprocessed_packet_batches, &scheduled_accounts, batch_request, &mut highest_wl_blocked_account_fees);
                                 }
                                 Err(_) => {
                                     break;
@@ -327,7 +327,7 @@ impl TransactionScheduler {
     fn try_schedule(
         deserialized_packet: &DeserializedPacket,
         bank: &Arc<Bank>,
-        blocked_account_fees: &mut HashMap<Pubkey, u64>,
+        highest_wl_blocked_account_fees: &mut HashMap<Pubkey, u64>,
         scheduled_accounts: &Arc<Mutex<AccountLocks>>,
     ) -> Result<SanitizedTransaction> {
         let sanitized_tx = Self::transaction_from_deserialized_packet(
@@ -353,7 +353,10 @@ impl TransactionScheduler {
                 .get_account_locks(&bank.feature_set)
                 .map_err(|e| SchedulerError::InvalidTransactionFormat(e))?;
 
-            trace!("blocked_account_fees: {:?}", blocked_account_fees);
+            trace!(
+                "blocked_account_fees: {:?}",
+                highest_wl_blocked_account_fees
+            );
 
             trace!(
                 "popped tx w/ priority: {}, readable: {:?}, writeable: {:?}",
@@ -365,7 +368,7 @@ impl TransactionScheduler {
             // Make sure that this transaction isn't blocked on another transaction that has a higher
             // fee for one of its accounts
             if let Err(e) = Self::check_higher_payer_than_blocked_accounts(
-                blocked_account_fees,
+                highest_wl_blocked_account_fees,
                 &account_locks.writable,
                 &account_locks.readonly,
                 priority,
@@ -376,7 +379,7 @@ impl TransactionScheduler {
                 );
                 Self::upsert_higher_fee_account_lock(
                     &account_locks,
-                    blocked_account_fees,
+                    highest_wl_blocked_account_fees,
                     priority,
                 );
                 return Err(e);
@@ -408,7 +411,7 @@ impl TransactionScheduler {
                 );
                 Self::upsert_higher_fee_account_lock(
                     &account_locks,
-                    blocked_account_fees,
+                    highest_wl_blocked_account_fees,
                     priority,
                 );
                 return Err(e);
@@ -420,7 +423,7 @@ impl TransactionScheduler {
                 .iter()
                 .chain(account_locks.readonly.iter())
             {
-                match blocked_account_fees.entry(**acc) {
+                match highest_wl_blocked_account_fees.entry(**acc) {
                     Entry::Occupied(blocked_fee) => {
                         if priority >= *blocked_fee.get() {
                             blocked_fee.remove();
@@ -429,7 +432,10 @@ impl TransactionScheduler {
                     Entry::Vacant(_) => {}
                 }
             }
-            trace!("updated blocked_account_fees: {:?}", blocked_account_fees);
+            trace!(
+                "updated blocked_account_fees: {:?}",
+                highest_wl_blocked_account_fees
+            );
             trace!("updated scheduled_accounts: {:?}", scheduled_accounts_l);
 
             Ok(sanitized_tx)
@@ -442,11 +448,7 @@ impl TransactionScheduler {
         blocked_account_fees: &mut HashMap<Pubkey, u64>,
         priority: u64,
     ) {
-        for acc in account_locks
-            .writable
-            .iter()
-            .chain(account_locks.readonly.iter())
-        {
+        for acc in &account_locks.writable {
             match blocked_account_fees.entry(**acc) {
                 Entry::Occupied(mut e) => {
                     if priority > *e.get() {
@@ -479,7 +481,7 @@ impl TransactionScheduler {
     fn get_scheduled_batch(
         unprocessed_packets: &mut UnprocessedPacketBatches,
         scheduled_accounts: &Arc<Mutex<AccountLocks>>,
-        highest_blocked_account_fees: &mut HashMap<Pubkey, u64>,
+        highest_wl_blocked_account_fees: &mut HashMap<Pubkey, u64>,
         num_txs: usize,
         bank: &Arc<Bank>,
     ) -> (Vec<SanitizedTransaction>, Vec<DeserializedPacket>) {
@@ -490,7 +492,7 @@ impl TransactionScheduler {
             match Self::try_schedule(
                 &deserialized_packet,
                 bank,
-                highest_blocked_account_fees,
+                highest_wl_blocked_account_fees,
                 scheduled_accounts,
             ) {
                 Ok(sanitized_tx) => {
@@ -535,7 +537,7 @@ impl TransactionScheduler {
         unprocessed_packets: &mut UnprocessedPacketBatches,
         scheduled_accounts: &Arc<Mutex<AccountLocks>>,
         scheduler_request: SchedulerRequest,
-        highest_blocked_account_fees: &mut HashMap<Pubkey, u64>,
+        highest_wl_blocked_account_fees: &mut HashMap<Pubkey, u64>,
     ) {
         let response_sender = scheduler_request.response_sender;
         match scheduler_request.msg {
@@ -544,7 +546,7 @@ impl TransactionScheduler {
                 let (sanitized_transactions, rescheduled_packets) = Self::get_scheduled_batch(
                     unprocessed_packets,
                     scheduled_accounts,
-                    highest_blocked_account_fees,
+                    highest_wl_blocked_account_fees,
                     num_txs,
                     &bank,
                 );
@@ -962,7 +964,6 @@ mod tests {
             // under previous logic, the previous batches would be [(300, 100), (200)] bc 300 and 100 can be parallelized
             // under this logic, we expect [(300), (200), (100)]
             // 200 has write priority on B
-            // TODO: we should test if 200 and 100 both try to read B RO and make sure they can get scheduled at the same time
             let tx1 = get_tx(
                 &[
                     get_account_meta(&accounts, "A", true),
@@ -1056,6 +1057,161 @@ mod tests {
         drop(gossip_vote_sender);
         assert_matches!(scheduler.join(), Ok(()));
     }
+
+    #[test]
+    fn test_blocked_transactions_read_locked() {
+        const BATCH_SIZE: usize = 128;
+        solana_logger::setup_with_default("trace");
+        let (tx_sender, tx_receiver) = unbounded();
+        let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
+        let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
+        let exit = Arc::new(AtomicBool::new(false));
+        let cost_model = Arc::new(RwLock::new(CostModel::default()));
+        let bank = Arc::new(Bank::default_for_tests());
+
+        let accounts = get_random_accounts();
+
+        let scheduler = TransactionScheduler::new(
+            tx_receiver,
+            tpu_vote_receiver,
+            gossip_vote_receiver,
+            exit.clone(),
+            cost_model,
+        );
+
+        // main logic
+        {
+            // 300: A, B(RO)
+            // 200: A, B(R0), C (RO), D (RO)
+            // 100:    B(R0), C (RO), D (RO), E
+            // should schedule as [(300, 100), (200)] because while 200 is blocked on 300 bc account A, it read-locks B so the ordering
+            // doesn't matter on 200, 100 or 100, 200
+            let tx1 = get_tx(
+                &[
+                    get_account_meta(&accounts, "A", true),
+                    get_account_meta(&accounts, "B", false),
+                ],
+                300,
+            );
+            let tx2 = get_tx(
+                &[
+                    get_account_meta(&accounts, "A", true),
+                    get_account_meta(&accounts, "B", false),
+                    get_account_meta(&accounts, "C", false),
+                    get_account_meta(&accounts, "D", false),
+                ],
+                200,
+            );
+            let tx3 = get_tx(
+                &[
+                    get_account_meta(&accounts, "B", false),
+                    get_account_meta(&accounts, "C", false),
+                    get_account_meta(&accounts, "D", false),
+                    get_account_meta(&accounts, "E", true),
+                ],
+                100,
+            );
+
+            send_transactions(&[&tx1, &tx2, &tx3], &tx_sender);
+
+            // should probably have gotten the packet by now
+            let _ = scheduler.send_ping(SchedulerStage::Transactions, 1);
+
+            let first_batch =
+                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            assert_eq!(first_batch.sanitized_transactions.len(), 2);
+            assert_eq!(
+                first_batch
+                    .sanitized_transactions
+                    .get(0)
+                    .unwrap()
+                    .signature(),
+                &tx1.signatures[0]
+            );
+            assert_eq!(
+                first_batch
+                    .sanitized_transactions
+                    .get(1)
+                    .unwrap()
+                    .signature(),
+                &tx3.signatures[0]
+            );
+
+            // attempt to request another transaction for schedule, won't schedule bc tx2 locked account A
+            assert_eq!(
+                scheduler
+                    .request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank)
+                    .sanitized_transactions
+                    .len(),
+                0
+            );
+
+            let _ = scheduler.send_batch_execution_update(
+                SchedulerStage::Transactions,
+                first_batch.sanitized_transactions,
+                vec![],
+            );
+
+            let second_batch =
+                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            assert_eq!(second_batch.sanitized_transactions.len(), 1);
+            assert_eq!(
+                second_batch
+                    .sanitized_transactions
+                    .get(0)
+                    .unwrap()
+                    .signature(),
+                &tx2.signatures[0]
+            );
+
+            let _ = scheduler.send_batch_execution_update(
+                SchedulerStage::Transactions,
+                second_batch.sanitized_transactions,
+                vec![],
+            );
+        }
+
+        drop(tx_sender);
+        drop(tpu_vote_sender);
+        drop(gossip_vote_sender);
+        assert_matches!(scheduler.join(), Ok(()));
+    }
+
+    // TODO: need to think of a clear and concise way to test this scheduler!
+
+    // TODO some other tests:
+    // 300: A(R), B, C
+    // 250: A(R), B, C
+    // 200: A(R), D, E
+    // request schedule: (300, 200)
+    // return (300, 200)
+    // request schedule: (250)
+    // return 250
+    // -----------------------
+    // 300: A(R), B, C,
+    // 250: A,    B, C,
+    // 200: A(R),       D, E
+    // request schedule: 300
+    // return 300
+    // request schedule: 250
+    // return 250
+    // request schedule: 200
+    // return 200
+    // -----------------------
+    // 300: A(R), B, C,
+    // 250: A,    B, C,
+    // 200: A(R),       D, E
+    // request schedule: 300
+    // insert:
+    // 275: A(R),       D(R)
+    // request schedule: 275
+    // request schedule: []
+    // return 300
+    // request schedule: 250
+    // return 275
+    // return 250
+    // request schedule: 200
+    // return 200
 
     /// Converts transactions to packets and sends them to scheduler over channel
     fn send_transactions(txs: &[&Transaction], tx_sender: &Sender<Vec<PacketBatch>>) {
