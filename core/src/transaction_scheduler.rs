@@ -204,11 +204,14 @@ impl TransactionScheduler {
         &self,
         stage: SchedulerStage,
         num_txs: usize,
-        bank: Arc<Bank>,
+        bank: &Arc<Bank>,
     ) -> ScheduledBatch {
         Self::make_scheduler_request(
             self.get_sender_from_stage(stage),
-            SchedulerMessage::RequestBatch { num_txs, bank },
+            SchedulerMessage::RequestBatch {
+                num_txs,
+                bank: bank.clone(),
+            },
         )
         .scheduled_batch()
     }
@@ -338,7 +341,7 @@ impl TransactionScheduler {
         // should evaluate these in the order of speed and likelihood
         // check QoS too!
 
-        let fee_per_cu = deserialized_packet.immutable_section().fee_per_cu();
+        let priority = deserialized_packet.immutable_section().priority();
 
         {
             let mut scheduled_accounts_l = scheduled_accounts.lock().unwrap();
@@ -353,8 +356,8 @@ impl TransactionScheduler {
             trace!("blocked_account_fees: {:?}", blocked_account_fees);
 
             trace!(
-                "tx fee: {}, readable: {:?}, writeable: {:?}",
-                fee_per_cu,
+                "popped tx w/ priority: {}, readable: {:?}, writeable: {:?}",
+                priority,
                 account_locks.readonly,
                 account_locks.writable
             );
@@ -365,16 +368,16 @@ impl TransactionScheduler {
                 blocked_account_fees,
                 &account_locks.writable,
                 &account_locks.readonly,
-                fee_per_cu,
+                priority,
             ) {
                 trace!(
                     "account is blocked by another blocked account, upsert account fee block: {}",
-                    fee_per_cu
+                    priority
                 );
                 Self::upsert_higher_fee_account_lock(
                     &account_locks,
                     blocked_account_fees,
-                    fee_per_cu,
+                    priority,
                 );
                 return Err(e);
             }
@@ -401,12 +404,12 @@ impl TransactionScheduler {
             ) {
                 trace!(
                     "account is blocked by an executing tx, upsert account fee block: {}",
-                    fee_per_cu
+                    priority
                 );
                 Self::upsert_higher_fee_account_lock(
                     &account_locks,
                     blocked_account_fees,
-                    fee_per_cu,
+                    priority,
                 );
                 return Err(e);
             }
@@ -419,7 +422,7 @@ impl TransactionScheduler {
             {
                 match blocked_account_fees.entry(**acc) {
                     Entry::Occupied(blocked_fee) => {
-                        if fee_per_cu >= *blocked_fee.get() {
+                        if priority >= *blocked_fee.get() {
                             blocked_fee.remove();
                         }
                     }
@@ -427,6 +430,7 @@ impl TransactionScheduler {
                 }
             }
             trace!("updated blocked_account_fees: {:?}", blocked_account_fees);
+            trace!("updated scheduled_accounts: {:?}", scheduled_accounts_l);
 
             Ok(sanitized_tx)
         }
@@ -436,7 +440,7 @@ impl TransactionScheduler {
     fn upsert_higher_fee_account_lock(
         account_locks: &TransactionAccountLocks,
         blocked_account_fees: &mut HashMap<Pubkey, u64>,
-        fee_per_cu: u64,
+        priority: u64,
     ) {
         for acc in account_locks
             .writable
@@ -445,12 +449,12 @@ impl TransactionScheduler {
         {
             match blocked_account_fees.entry(**acc) {
                 Entry::Occupied(mut e) => {
-                    if fee_per_cu > *e.get() {
-                        e.insert(fee_per_cu);
+                    if priority > *e.get() {
+                        e.insert(priority);
                     }
                 }
                 Entry::Vacant(e) => {
-                    e.insert(fee_per_cu);
+                    e.insert(priority);
                 }
             }
         }
@@ -579,12 +583,14 @@ impl TransactionScheduler {
                         .chain(rescheduled_transactions.iter())
                     {
                         let tx_locks = tx.get_account_locks_unchecked();
+                        trace!("unlocking locks: {:?}", tx_locks);
                         Self::drop_account_locks(
                             &mut account_locks,
                             &tx_locks.writable,
                             &tx_locks.readonly,
                         );
                     }
+                    trace!("dropped account locks, account_locks: {:?}", account_locks);
                 }
                 // TODO (LB): reschedule transactions
                 // for tx in rescheduled_transactions {
@@ -640,7 +646,6 @@ impl TransactionScheduler {
         Ok(())
     }
 
-    /// NOTE: this is copied from accounts.rs
     fn drop_account_locks(
         account_locks: &mut AccountLocks,
         writable_keys: &[&Pubkey],
@@ -689,12 +694,9 @@ impl TransactionScheduler {
                 .enumerate()
                 .filter_map(|(idx, p)| if !p.meta.discard() { Some(idx) } else { None })
                 .collect();
-            number_of_dropped_packets +=
-                unprocessed_packets.insert_batch(unprocessed_packet_batches::deserialize_packets(
-                    &packet_batch,
-                    &packet_indexes,
-                    None,
-                ));
+            number_of_dropped_packets += unprocessed_packets.insert_batch(
+                unprocessed_packet_batches::deserialize_packets(&packet_batch, &packet_indexes),
+            );
             num_added += packet_indexes.len();
         }
         trace!(
@@ -717,10 +719,12 @@ impl TransactionScheduler {
 
 #[cfg(test)]
 mod tests {
+    use crossbeam_channel::Sender;
     use solana_runtime::bank::Bank;
     use solana_sdk::compute_budget::ComputeBudgetInstruction;
     use solana_sdk::instruction::AccountMeta;
     use solana_sdk::pubkey::Pubkey;
+    use std::collections::HashMap;
     use {
         crate::transaction_scheduler::{SchedulerStage, TransactionScheduler},
         crossbeam_channel::unbounded,
@@ -740,72 +744,126 @@ mod tests {
         },
     };
 
+    // #[test]
+    // fn test_start_and_join_channel_dropped() {
+    //     let (tx_sender, tx_receiver) = unbounded();
+    //     let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
+    //     let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
+    //     let exit = Arc::new(AtomicBool::new(false));
+    //     let cost_model = Arc::new(RwLock::new(CostModel::default()));
+    //
+    //     let scheduler = TransactionScheduler::new(
+    //         tx_receiver,
+    //         tpu_vote_receiver,
+    //         gossip_vote_receiver,
+    //         exit,
+    //         cost_model,
+    //     );
+    //
+    //     // check alive
+    //     assert_eq!(scheduler.send_ping(SchedulerStage::Transactions, 1).id, 1);
+    //     assert_eq!(scheduler.send_ping(SchedulerStage::GossipVotes, 2).id, 2);
+    //     assert_eq!(scheduler.send_ping(SchedulerStage::TpuVotes, 3).id, 3);
+    //
+    //     drop(tx_sender);
+    //     drop(tpu_vote_sender);
+    //     drop(gossip_vote_sender);
+    //
+    //     assert_matches!(scheduler.join(), Ok(()));
+    // }
+    //
+    // #[test]
+    // fn test_start_and_join_channel_exit_signal() {
+    //     let (tx_sender, tx_receiver) = unbounded();
+    //     let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
+    //     let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
+    //     let exit = Arc::new(AtomicBool::new(false));
+    //
+    //     let cost_model = Arc::new(RwLock::new(CostModel::default()));
+    //
+    //     let scheduler = TransactionScheduler::new(
+    //         tx_receiver,
+    //         tpu_vote_receiver,
+    //         gossip_vote_receiver,
+    //         exit.clone(),
+    //         cost_model,
+    //     );
+    //
+    //     // check alive
+    //     assert_eq!(scheduler.send_ping(SchedulerStage::Transactions, 1).id, 1);
+    //     assert_eq!(scheduler.send_ping(SchedulerStage::GossipVotes, 2).id, 2);
+    //     assert_eq!(scheduler.send_ping(SchedulerStage::TpuVotes, 3).id, 3);
+    //
+    //     exit.store(true, Ordering::Relaxed);
+    //
+    //     assert_matches!(scheduler.join(), Ok(()));
+    //     drop(tx_sender);
+    //     drop(tpu_vote_sender);
+    //     drop(gossip_vote_sender);
+    // }
+    //
+    // #[test]
+    // fn test_single_tx() {
+    //     solana_logger::setup_with_default("trace");
+    //     let (tx_sender, tx_receiver) = unbounded();
+    //     let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
+    //     let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
+    //     let exit = Arc::new(AtomicBool::new(false));
+    //     let cost_model = Arc::new(RwLock::new(CostModel::default()));
+    //     let bank = Arc::new(Bank::default_for_tests());
+    //
+    //     let accounts = get_random_accounts();
+    //
+    //     let scheduler = TransactionScheduler::new(
+    //         tx_receiver,
+    //         tpu_vote_receiver,
+    //         gossip_vote_receiver,
+    //         exit.clone(),
+    //         cost_model,
+    //     );
+    //
+    //     // main logic
+    //     {
+    //         let tx = get_tx(&[get_account_meta(&accounts, "A", true)], 200);
+    //
+    //         send_transactions(&[&tx], &tx_sender);
+    //
+    //         // should probably have gotten the packet by now
+    //         let _ = scheduler.send_ping(SchedulerStage::Transactions, 1);
+    //
+    //         // make sure the requested batch is the single packet
+    //         let mut batch = scheduler.request_batch(SchedulerStage::Transactions, 1, &bank);
+    //         assert_eq!(batch.sanitized_transactions.len(), 1);
+    //         assert_eq!(
+    //             batch.sanitized_transactions.pop().unwrap().signature(),
+    //             &tx.signatures[0]
+    //         );
+    //
+    //         // make sure the batch is unlocked
+    //         let _ = scheduler.send_batch_execution_update(
+    //             SchedulerStage::Transactions,
+    //             batch.sanitized_transactions,
+    //             vec![],
+    //         );
+    //     }
+    //
+    //     drop(tx_sender);
+    //     drop(tpu_vote_sender);
+    //     drop(gossip_vote_sender);
+    //     assert_matches!(scheduler.join(), Ok(()));
+    // }
+
     #[test]
-    fn test_start_and_join_channel_dropped() {
-        let (tx_sender, tx_receiver) = unbounded();
-        let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
-        let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
-        let exit = Arc::new(AtomicBool::new(false));
-        let cost_model = Arc::new(RwLock::new(CostModel::default()));
-
-        let scheduler = TransactionScheduler::new(
-            tx_receiver,
-            tpu_vote_receiver,
-            gossip_vote_receiver,
-            exit,
-            cost_model,
-        );
-
-        // check alive
-        assert_eq!(scheduler.send_ping(SchedulerStage::Transactions, 1).id, 1);
-        assert_eq!(scheduler.send_ping(SchedulerStage::GossipVotes, 2).id, 2);
-        assert_eq!(scheduler.send_ping(SchedulerStage::TpuVotes, 3).id, 3);
-
-        drop(tx_sender);
-        drop(tpu_vote_sender);
-        drop(gossip_vote_sender);
-
-        assert_matches!(scheduler.join(), Ok(()));
-    }
-
-    #[test]
-    fn test_start_and_join_channel_exit_signal() {
-        let (tx_sender, tx_receiver) = unbounded();
-        let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
-        let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
-        let exit = Arc::new(AtomicBool::new(false));
-
-        let cost_model = Arc::new(RwLock::new(CostModel::default()));
-
-        let scheduler = TransactionScheduler::new(
-            tx_receiver,
-            tpu_vote_receiver,
-            gossip_vote_receiver,
-            exit.clone(),
-            cost_model,
-        );
-
-        // check alive
-        assert_eq!(scheduler.send_ping(SchedulerStage::Transactions, 1).id, 1);
-        assert_eq!(scheduler.send_ping(SchedulerStage::GossipVotes, 2).id, 2);
-        assert_eq!(scheduler.send_ping(SchedulerStage::TpuVotes, 3).id, 3);
-
-        exit.store(true, Ordering::Relaxed);
-
-        assert_matches!(scheduler.join(), Ok(()));
-        drop(tx_sender);
-        drop(tpu_vote_sender);
-        drop(gossip_vote_sender);
-    }
-
-    #[test]
-    fn test_simple_no_fee() {
+    fn test_conflicting_transactions_same_fee() {
         solana_logger::setup_with_default("trace");
         let (tx_sender, tx_receiver) = unbounded();
         let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
         let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
         let exit = Arc::new(AtomicBool::new(false));
         let cost_model = Arc::new(RwLock::new(CostModel::default()));
+        let bank = Arc::new(Bank::default_for_tests());
+
+        let accounts = get_random_accounts();
 
         let scheduler = TransactionScheduler::new(
             tx_receiver,
@@ -815,46 +873,56 @@ mod tests {
             cost_model,
         );
 
-        let a = Keypair::new().pubkey();
-        let b = Keypair::new().pubkey();
-        let c = Keypair::new().pubkey();
+        // main logic
+        {
+            let tx1 = get_tx(&[get_account_meta(&accounts, "A", true)], 200);
+            let tx2 = get_tx(&[get_account_meta(&accounts, "A", true)], 250);
 
-        let tx0_kp = Keypair::new();
-        let tx0 = Transaction::new_signed_with_payer(
-            &[Instruction::new_with_bytes(
-                system_program::id(),
-                &[0],
-                vec![
-                    AccountMeta::new(a.clone(), false),
-                    AccountMeta::new(b.clone(), false),
-                    AccountMeta::new(c.clone(), false),
-                ],
-            )],
-            Some(&tx0_kp.pubkey()),
-            &[&tx0_kp],
-            Hash::default(),
-        );
-        let serialized_packet = Packet::from_data(None, &tx0).unwrap();
-        tx_sender
-            .send(vec![PacketBatch::new(vec![serialized_packet])])
-            .unwrap();
+            send_transactions(&[&tx1, &tx2], &tx_sender);
 
-        let _ = scheduler.send_ping(SchedulerStage::Transactions, 1);
+            // should probably have gotten the packet by now
+            let _ = scheduler.send_ping(SchedulerStage::Transactions, 1);
 
-        let bank = Arc::new(Bank::default_for_tests());
+            // request two transactions, tx2 should be scheduled because it has higher fee for account A
+            let first_batch = scheduler.request_batch(SchedulerStage::Transactions, 2, &bank);
+            assert_eq!(first_batch.sanitized_transactions.len(), 1);
+            assert_eq!(
+                first_batch
+                    .sanitized_transactions
+                    .get(0)
+                    .unwrap()
+                    .signature(),
+                &tx2.signatures[0]
+            );
 
-        let mut batch = scheduler.request_batch(SchedulerStage::Transactions, 1, bank);
-        assert_eq!(batch.sanitized_transactions.len(), 1);
-        assert_eq!(
-            batch.sanitized_transactions.pop().unwrap().signature(),
-            &tx0.signatures[0]
-        );
+            // attempt to request another transaction for schedule, won't schedule bc tx2 locked account A
+            assert_eq!(
+                scheduler
+                    .request_batch(SchedulerStage::Transactions, 2, &bank)
+                    .sanitized_transactions
+                    .len(),
+                0
+            );
 
-        let _ = scheduler.send_batch_execution_update(
-            SchedulerStage::Transactions,
-            batch.sanitized_transactions,
-            vec![],
-        );
+            // make sure the tx2 is unlocked by sending it execution results of that batch
+            let _ = scheduler.send_batch_execution_update(
+                SchedulerStage::Transactions,
+                first_batch.sanitized_transactions,
+                vec![],
+            );
+
+            // tx1 should schedule now that tx2 is done executing
+            let second_batch = scheduler.request_batch(SchedulerStage::Transactions, 2, &bank);
+            assert_eq!(second_batch.sanitized_transactions.len(), 1);
+            assert_eq!(
+                second_batch
+                    .sanitized_transactions
+                    .get(0)
+                    .unwrap()
+                    .signature(),
+                &tx1.signatures[0]
+            );
+        }
 
         drop(tx_sender);
         drop(tpu_vote_sender);
@@ -862,8 +930,73 @@ mod tests {
         assert_matches!(scheduler.join(), Ok(()));
     }
 
-    fn build_tx(account_metas: &[AccountMeta], fee_per_cu: u64) -> Transaction {
+    /// Converts transactions to packets and sends them to scheduler over channel
+    fn send_transactions(txs: &[&Transaction], tx_sender: &Sender<Vec<PacketBatch>>) {
+        let packets = txs
+            .into_iter()
+            .map(|tx| Packet::from_data(None, *tx).unwrap());
+        tx_sender
+            .send(vec![PacketBatch::new(packets.collect())])
+            .unwrap();
+    }
+
+    /// Builds some arbitrary transaction with given AccountMetas and prioritization fee
+    fn get_tx(account_metas: &[AccountMeta], micro_lamports_fee_per_cu: u64) -> Transaction {
         let kp = Keypair::new();
-        Transaction::new_signed_with_payer(&[ComputeBudgetInstruction::set_prioritization_fee()])
+        Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_price(micro_lamports_fee_per_cu),
+                Instruction::new_with_bytes(system_program::id(), &[0], account_metas.to_vec()),
+            ],
+            Some(&kp.pubkey()),
+            &[&kp],
+            Hash::default(),
+        )
+    }
+
+    /// Gets random accounts w/ alphabetical access for easy testing.
+    fn get_random_accounts() -> HashMap<&'static str, Pubkey> {
+        HashMap::from([
+            ("A", Pubkey::new_unique()),
+            ("B", Pubkey::new_unique()),
+            ("C", Pubkey::new_unique()),
+            ("D", Pubkey::new_unique()),
+            ("E", Pubkey::new_unique()),
+            ("F", Pubkey::new_unique()),
+            ("G", Pubkey::new_unique()),
+            ("H", Pubkey::new_unique()),
+            ("I", Pubkey::new_unique()),
+            ("J", Pubkey::new_unique()),
+            ("K", Pubkey::new_unique()),
+            ("L", Pubkey::new_unique()),
+            ("M", Pubkey::new_unique()),
+            ("N", Pubkey::new_unique()),
+            ("O", Pubkey::new_unique()),
+            ("P", Pubkey::new_unique()),
+            ("Q", Pubkey::new_unique()),
+            ("R", Pubkey::new_unique()),
+            ("S", Pubkey::new_unique()),
+            ("T", Pubkey::new_unique()),
+            ("U", Pubkey::new_unique()),
+            ("V", Pubkey::new_unique()),
+            ("W", Pubkey::new_unique()),
+            ("X", Pubkey::new_unique()),
+            ("Y", Pubkey::new_unique()),
+            ("Z", Pubkey::new_unique()),
+        ])
+    }
+
+    /// Returns pubkey from map created above
+    fn get_pubkey(map: &HashMap<&str, Pubkey>, char: &str) -> Pubkey {
+        return map.get(char).unwrap().clone();
+    }
+
+    /// Returns AccountMeta with pubkey from account above and writeable flag set
+    fn get_account_meta(map: &HashMap<&str, Pubkey>, char: &str, is_writable: bool) -> AccountMeta {
+        if is_writable {
+            AccountMeta::new(get_pubkey(map, char), false)
+        } else {
+            AccountMeta::new_readonly(get_pubkey(map, char), false)
+        }
     }
 }
