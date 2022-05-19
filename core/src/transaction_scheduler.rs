@@ -1174,6 +1174,153 @@ mod tests {
         assert_matches!(scheduler.join(), Ok(()));
     }
 
+    #[test]
+    fn test_blocked_transactions_write_lock_released() {
+        const BATCH_SIZE: usize = 128;
+        solana_logger::setup_with_default("trace");
+        let (tx_sender, tx_receiver) = unbounded();
+        let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
+        let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
+        let exit = Arc::new(AtomicBool::new(false));
+        let cost_model = Arc::new(RwLock::new(CostModel::default()));
+        let bank = Arc::new(Bank::default_for_tests());
+
+        let accounts = get_random_accounts();
+
+        let scheduler = TransactionScheduler::new(
+            tx_receiver,
+            tpu_vote_receiver,
+            gossip_vote_receiver,
+            exit.clone(),
+            cost_model,
+        );
+
+        // main logic
+        {
+            // 300: A, B(RO)
+            // 200: A, B(R0), C (RO), D (RO)
+            // 100:    B(R0), C (RO), D (RO), E
+            //  50: A, B(R0), C (RO), D (RO), E
+            // should schedule as [(300, 100), (200), (50)]
+            let tx1 = get_tx(
+                &[
+                    get_account_meta(&accounts, "A", true),
+                    get_account_meta(&accounts, "B", false),
+                ],
+                300,
+            );
+            let tx2 = get_tx(
+                &[
+                    get_account_meta(&accounts, "A", true),
+                    get_account_meta(&accounts, "B", false),
+                    get_account_meta(&accounts, "C", false),
+                    get_account_meta(&accounts, "D", false),
+                ],
+                200,
+            );
+            let tx3 = get_tx(
+                &[
+                    get_account_meta(&accounts, "B", false),
+                    get_account_meta(&accounts, "C", false),
+                    get_account_meta(&accounts, "D", false),
+                    get_account_meta(&accounts, "E", true),
+                ],
+                100,
+            );
+            let tx4 = get_tx(
+                &[
+                    get_account_meta(&accounts, "A", true),
+                    get_account_meta(&accounts, "B", false),
+                    get_account_meta(&accounts, "C", false),
+                    get_account_meta(&accounts, "D", false),
+                    get_account_meta(&accounts, "E", true),
+                ],
+                50,
+            );
+
+            send_transactions(&[&tx1, &tx2, &tx3, &tx4], &tx_sender);
+
+            // should probably have gotten the packet by now
+            let _ = scheduler.send_ping(SchedulerStage::Transactions, 1);
+
+            let first_batch =
+                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            assert_eq!(first_batch.sanitized_transactions.len(), 2);
+            assert_eq!(
+                first_batch
+                    .sanitized_transactions
+                    .get(0)
+                    .unwrap()
+                    .signature(),
+                &tx1.signatures[0]
+            );
+            assert_eq!(
+                first_batch
+                    .sanitized_transactions
+                    .get(1)
+                    .unwrap()
+                    .signature(),
+                &tx3.signatures[0]
+            );
+
+            // attempt to request another transaction for schedule, won't schedule bc tx2 locked account A
+            assert_eq!(
+                scheduler
+                    .request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank)
+                    .sanitized_transactions
+                    .len(),
+                0
+            );
+
+            let _ = scheduler.send_batch_execution_update(
+                SchedulerStage::Transactions,
+                first_batch.sanitized_transactions,
+                vec![],
+            );
+
+            let second_batch =
+                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            assert_eq!(second_batch.sanitized_transactions.len(), 1);
+            assert_eq!(
+                second_batch
+                    .sanitized_transactions
+                    .get(0)
+                    .unwrap()
+                    .signature(),
+                &tx2.signatures[0]
+            );
+
+            let _ = scheduler.send_batch_execution_update(
+                SchedulerStage::Transactions,
+                second_batch.sanitized_transactions,
+                vec![],
+            );
+
+            let third_batch =
+                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            assert_eq!(third_batch.sanitized_transactions.len(), 1);
+            assert_eq!(
+                third_batch
+                    .sanitized_transactions
+                    .get(0)
+                    .unwrap()
+                    .signature(),
+                &tx4.signatures[0]
+            );
+
+            let _ = scheduler.send_batch_execution_update(
+                SchedulerStage::Transactions,
+                third_batch.sanitized_transactions,
+                vec![],
+            );
+        }
+
+        drop(tx_sender);
+        drop(tpu_vote_sender);
+        drop(gossip_vote_sender);
+        assert_matches!(scheduler.join(), Ok(()));
+    }
+
     // TODO: need to think of a clear and concise way to test this scheduler!
 
     // TODO some other tests:
