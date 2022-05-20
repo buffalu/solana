@@ -6,7 +6,6 @@
 use {
     crate::{
         qos_service::QosService,
-        transaction_scheduler::SchedulerError::TransactionCheckFailed,
         unprocessed_packet_batches::{
             self, DeserializedPacket, ImmutableDeserializedPacket, UnprocessedPacketBatches,
         },
@@ -499,7 +498,7 @@ impl TransactionScheduler {
                             // non-recoverable error, drop the packet
                             continue;
                         }
-                        TransactionCheckFailed(_) => {
+                        SchedulerError::TransactionCheckFailed(_) => {
                             // non-recoverable error, drop the packet
                             continue;
                         }
