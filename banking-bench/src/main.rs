@@ -1,4 +1,5 @@
 #![allow(clippy::integer_arithmetic)]
+use solana_core::transaction_scheduler::TransactionScheduler;
 use {
     clap::{crate_description, crate_name, Arg, ArgEnum, Command},
     crossbeam_channel::{unbounded, Receiver},
@@ -334,16 +335,25 @@ fn main() {
             SocketAddrSpace::Unspecified,
         );
         let cluster_info = Arc::new(cluster_info);
+
+        let cost_model = Arc::new(RwLock::new(CostModel::default()));
+
+        let transaction_scheduler = TransactionScheduler::new(
+            verified_receiver.clone(),
+            tpu_vote_receiver.clone(),
+            vote_receiver.clone(),
+            exit.clone(),
+            cost_model.clone(),
+        );
+
         let banking_stage = BankingStage::new_num_threads(
             &cluster_info,
             &poh_recorder,
-            verified_receiver,
-            tpu_vote_receiver,
-            vote_receiver,
+            &transaction_scheduler,
             num_banking_threads,
             None,
             replay_vote_sender,
-            Arc::new(RwLock::new(CostModel::default())),
+            cost_model,
         );
         poh_recorder.lock().unwrap().set_bank(&bank);
 

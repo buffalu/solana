@@ -129,6 +129,64 @@ pub enum SchedulerError {
 
 pub type Result<T> = std::result::Result<T, SchedulerError>;
 
+#[derive(Clone)]
+pub struct TransactionSchedulerHandle {
+    sender: Sender<SchedulerRequest>,
+}
+
+impl TransactionSchedulerHandle {
+    pub fn new(sender: Sender<SchedulerRequest>) -> TransactionSchedulerHandle {
+        TransactionSchedulerHandle { sender }
+    }
+
+    /// Requests a batch of num_txs transactions from one of the scheduler stages.
+    pub fn request_batch(&self, num_txs: usize, bank: &Arc<Bank>) -> ScheduledBatch {
+        Self::make_scheduler_request(
+            &self.sender,
+            SchedulerMessage::RequestBatch {
+                num_txs,
+                bank: bank.clone(),
+            },
+        )
+        .scheduled_batch()
+    }
+
+    /// Ping-pong a scheduler stage
+    pub fn send_ping(&self, id: usize) -> Pong {
+        Self::make_scheduler_request(&self.sender, SchedulerMessage::Ping { id }).pong()
+    }
+
+    /// Send the scheduler an update on what was scheduled
+    pub fn send_batch_execution_update(
+        &self,
+        executed_transactions: Vec<SanitizedTransaction>,
+        rescheduled_transactions: Vec<SanitizedTransaction>,
+    ) -> ExecutedBatchResponse {
+        Self::make_scheduler_request(
+            &self.sender,
+            SchedulerMessage::ExecutedBatchUpdate {
+                executed_transactions,
+                rescheduled_transactions,
+            },
+        )
+        .executed_batch_response()
+    }
+
+    /// Sends a scheduler request and blocks on waiting for a response
+    fn make_scheduler_request(
+        request_sender: &Sender<SchedulerRequest>,
+        msg: SchedulerMessage,
+    ) -> SchedulerResponse {
+        let (response_sender, response_receiver) = unbounded();
+        let request = SchedulerRequest {
+            msg,
+            response_sender,
+        };
+        let _ = request_sender.send(request).unwrap();
+        response_receiver.recv().unwrap()
+    }
+}
+
 pub struct TransactionScheduler {
     tx_request_handler_thread: JoinHandle<()>,
     tx_scheduler_request_sender: Sender<SchedulerRequest>,
@@ -196,61 +254,9 @@ impl TransactionScheduler {
     // Client methods
     // ***************************************************************
 
-    /// Requests a batch of num_txs transactions from one of the scheduler stages.
-    pub fn request_batch(
-        &self,
-        stage: SchedulerStage,
-        num_txs: usize,
-        bank: &Arc<Bank>,
-    ) -> ScheduledBatch {
-        Self::make_scheduler_request(
-            self.get_sender_from_stage(stage),
-            SchedulerMessage::RequestBatch {
-                num_txs,
-                bank: bank.clone(),
-            },
-        )
-        .scheduled_batch()
-    }
-
-    /// Ping-pong a scheduler stage
-    pub fn send_ping(&self, stage: SchedulerStage, id: usize) -> Pong {
-        Self::make_scheduler_request(
-            self.get_sender_from_stage(stage),
-            SchedulerMessage::Ping { id },
-        )
-        .pong()
-    }
-
-    /// Send the scheduler an update on what was scheduled
-    pub fn send_batch_execution_update(
-        &self,
-        stage: SchedulerStage,
-        executed_transactions: Vec<SanitizedTransaction>,
-        rescheduled_transactions: Vec<SanitizedTransaction>,
-    ) -> ExecutedBatchResponse {
-        Self::make_scheduler_request(
-            self.get_sender_from_stage(stage),
-            SchedulerMessage::ExecutedBatchUpdate {
-                executed_transactions,
-                rescheduled_transactions,
-            },
-        )
-        .executed_batch_response()
-    }
-
-    /// Sends a scheduler request and blocks on waiting for a response
-    fn make_scheduler_request(
-        request_sender: &Sender<SchedulerRequest>,
-        msg: SchedulerMessage,
-    ) -> SchedulerResponse {
-        let (response_sender, response_receiver) = unbounded();
-        let request = SchedulerRequest {
-            msg,
-            response_sender,
-        };
-        let _ = request_sender.send(request).unwrap();
-        response_receiver.recv().unwrap()
+    /// Returns a handle to one of the schedulers
+    pub fn get_handle(&self, scheduler_stage: SchedulerStage) -> TransactionSchedulerHandle {
+        TransactionSchedulerHandle::new(self.get_sender_from_stage(scheduler_stage).clone())
     }
 
     /// Clean up the threads
@@ -297,7 +303,6 @@ impl TransactionScheduler {
                         recv(scheduler_request_receiver) -> maybe_batch_request => {
                             match maybe_batch_request {
                                 Ok(batch_request) => {
-                                    // rescheduled txs might get big, so allocated outside of this fn
                                     Self::handle_scheduler_request(&mut unprocessed_packet_batches, &scheduled_accounts, batch_request);
                                 }
                                 Err(_) => {
@@ -747,10 +752,14 @@ mod tests {
             cost_model,
         );
 
+        let tx_handle = scheduler.get_handle(SchedulerStage::Transactions);
+        let gossip_vote_handle = scheduler.get_handle(SchedulerStage::GossipVotes);
+        let tpu_vote_handle = scheduler.get_handle(SchedulerStage::TpuVotes);
+
         // check alive
-        assert_eq!(scheduler.send_ping(SchedulerStage::Transactions, 1).id, 1);
-        assert_eq!(scheduler.send_ping(SchedulerStage::GossipVotes, 2).id, 2);
-        assert_eq!(scheduler.send_ping(SchedulerStage::TpuVotes, 3).id, 3);
+        assert_eq!(tx_handle.send_ping(1).id, 1);
+        assert_eq!(gossip_vote_handle.send_ping(2).id, 2);
+        assert_eq!(tpu_vote_handle.send_ping(3).id, 3);
 
         drop(tx_sender);
         drop(tpu_vote_sender);
@@ -776,10 +785,14 @@ mod tests {
             cost_model,
         );
 
+        let tx_handle = scheduler.get_handle(SchedulerStage::Transactions);
+        let gossip_vote_handle = scheduler.get_handle(SchedulerStage::GossipVotes);
+        let tpu_vote_handle = scheduler.get_handle(SchedulerStage::TpuVotes);
+
         // check alive
-        assert_eq!(scheduler.send_ping(SchedulerStage::Transactions, 1).id, 1);
-        assert_eq!(scheduler.send_ping(SchedulerStage::GossipVotes, 2).id, 2);
-        assert_eq!(scheduler.send_ping(SchedulerStage::TpuVotes, 3).id, 3);
+        assert_eq!(tx_handle.send_ping(1).id, 1);
+        assert_eq!(gossip_vote_handle.send_ping(2).id, 2);
+        assert_eq!(tpu_vote_handle.send_ping(3).id, 3);
 
         exit.store(true, Ordering::Relaxed);
 
@@ -808,6 +821,7 @@ mod tests {
             exit.clone(),
             cost_model,
         );
+        let tx_handle = scheduler.get_handle(SchedulerStage::Transactions);
 
         // main logic
         {
@@ -816,10 +830,10 @@ mod tests {
             send_transactions(&[&tx], &tx_sender);
 
             // should probably have gotten the packet by now
-            let _ = scheduler.send_ping(SchedulerStage::Transactions, 1);
+            let _ = tx_handle.send_ping(1);
 
             // make sure the requested batch is the single packet
-            let mut batch = scheduler.request_batch(SchedulerStage::Transactions, 1, &bank);
+            let mut batch = tx_handle.request_batch(1, &bank);
             assert_eq!(batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 batch.sanitized_transactions.pop().unwrap().signature(),
@@ -827,11 +841,7 @@ mod tests {
             );
 
             // make sure the batch is unlocked
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                batch.sanitized_transactions,
-                vec![],
-            );
+            let _ = tx_handle.send_batch_execution_update(batch.sanitized_transactions, vec![]);
         }
 
         drop(tx_sender);
@@ -860,6 +870,7 @@ mod tests {
             exit.clone(),
             cost_model,
         );
+        let tx_handle = scheduler.get_handle(SchedulerStage::Transactions);
 
         // main logic
         {
@@ -869,11 +880,10 @@ mod tests {
             send_transactions(&[&tx1, &tx2], &tx_sender);
 
             // should probably have gotten the packet by now
-            let _ = scheduler.send_ping(SchedulerStage::Transactions, 1);
+            let _ = tx_handle.send_ping(1);
 
             // request two transactions, tx2 should be scheduled because it has higher fee for account A
-            let first_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let first_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(first_batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 first_batch
@@ -886,23 +896,19 @@ mod tests {
 
             // attempt to request another transaction for schedule, won't schedule bc tx2 locked account A
             assert_eq!(
-                scheduler
-                    .request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank)
+                tx_handle
+                    .request_batch(BATCH_SIZE, &bank)
                     .sanitized_transactions
                     .len(),
                 0
             );
 
             // make sure the tx2 is unlocked by sending it execution results of that batch
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                first_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(first_batch.sanitized_transactions, vec![]);
 
             // tx1 should schedule now that tx2 is done executing
-            let second_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let second_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(second_batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 second_batch
@@ -940,6 +946,7 @@ mod tests {
             exit.clone(),
             cost_model,
         );
+        let tx_handle = scheduler.get_handle(SchedulerStage::Transactions);
 
         // main logic
         {
@@ -977,10 +984,9 @@ mod tests {
             send_transactions(&[&tx1, &tx2, &tx3], &tx_sender);
 
             // should probably have gotten the packet by now
-            let _ = scheduler.send_ping(SchedulerStage::Transactions, 1);
+            let _ = tx_handle.send_ping(1);
 
-            let first_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let first_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(first_batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 first_batch
@@ -993,21 +999,17 @@ mod tests {
 
             // attempt to request another transaction for schedule, won't schedule bc tx2 locked account A
             assert_eq!(
-                scheduler
-                    .request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank)
+                tx_handle
+                    .request_batch(BATCH_SIZE, &bank)
                     .sanitized_transactions
                     .len(),
                 0
             );
 
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                first_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(first_batch.sanitized_transactions, vec![]);
 
-            let second_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let second_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(second_batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 second_batch
@@ -1018,14 +1020,10 @@ mod tests {
                 &tx2.signatures[0]
             );
 
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                second_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(second_batch.sanitized_transactions, vec![]);
 
-            let third_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let third_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(third_batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 third_batch
@@ -1063,6 +1061,7 @@ mod tests {
             exit.clone(),
             cost_model,
         );
+        let tx_handle = scheduler.get_handle(SchedulerStage::Transactions);
 
         // main logic
         {
@@ -1100,10 +1099,9 @@ mod tests {
             send_transactions(&[&tx1, &tx2, &tx3], &tx_sender);
 
             // should probably have gotten the packet by now
-            let _ = scheduler.send_ping(SchedulerStage::Transactions, 1);
+            let _ = tx_handle.send_ping(1);
 
-            let first_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let first_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(first_batch.sanitized_transactions.len(), 2);
             assert_eq!(
                 first_batch
@@ -1124,21 +1122,17 @@ mod tests {
 
             // attempt to request another transaction for schedule, won't schedule bc tx2 locked account A
             assert_eq!(
-                scheduler
-                    .request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank)
+                tx_handle
+                    .request_batch(BATCH_SIZE, &bank)
                     .sanitized_transactions
                     .len(),
                 0
             );
 
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                first_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(first_batch.sanitized_transactions, vec![]);
 
-            let second_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let second_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(second_batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 second_batch
@@ -1149,11 +1143,8 @@ mod tests {
                 &tx2.signatures[0]
             );
 
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                second_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(second_batch.sanitized_transactions, vec![]);
         }
 
         drop(tx_sender);
@@ -1182,6 +1173,7 @@ mod tests {
             exit.clone(),
             cost_model,
         );
+        let tx_handle = scheduler.get_handle(SchedulerStage::Transactions);
 
         // main logic
         {
@@ -1229,10 +1221,9 @@ mod tests {
             send_transactions(&[&tx1, &tx2, &tx3, &tx4], &tx_sender);
 
             // should probably have gotten the packet by now
-            let _ = scheduler.send_ping(SchedulerStage::Transactions, 1);
+            let _ = tx_handle.send_ping(1);
 
-            let first_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let first_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(first_batch.sanitized_transactions.len(), 2);
             assert_eq!(
                 first_batch
@@ -1253,21 +1244,17 @@ mod tests {
 
             // attempt to request another transaction for schedule, won't schedule bc tx2 locked account A
             assert_eq!(
-                scheduler
-                    .request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank)
+                tx_handle
+                    .request_batch(BATCH_SIZE, &bank)
                     .sanitized_transactions
                     .len(),
                 0
             );
 
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                first_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(first_batch.sanitized_transactions, vec![]);
 
-            let second_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let second_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(second_batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 second_batch
@@ -1278,14 +1265,10 @@ mod tests {
                 &tx2.signatures[0]
             );
 
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                second_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(second_batch.sanitized_transactions, vec![]);
 
-            let third_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let third_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(third_batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 third_batch
@@ -1296,11 +1279,8 @@ mod tests {
                 &tx4.signatures[0]
             );
 
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                third_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(third_batch.sanitized_transactions, vec![]);
         }
 
         drop(tx_sender);
@@ -1329,6 +1309,7 @@ mod tests {
             exit.clone(),
             cost_model,
         );
+        let tx_handle = scheduler.get_handle(SchedulerStage::Transactions);
 
         {
             // 300: A, B, C
@@ -1376,8 +1357,7 @@ mod tests {
 
             send_transactions(&[&tx1, &tx2, &tx3, &tx4], &tx_sender);
 
-            let first_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let first_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(first_batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 first_batch
@@ -1387,14 +1367,10 @@ mod tests {
                     .signature(),
                 &tx1.signatures[0]
             );
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                first_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(first_batch.sanitized_transactions, vec![]);
 
-            let second_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let second_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(second_batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 second_batch
@@ -1404,14 +1380,10 @@ mod tests {
                     .signature(),
                 &tx2.signatures[0]
             );
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                second_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(second_batch.sanitized_transactions, vec![]);
 
-            let third_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let third_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(third_batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 third_batch
@@ -1421,14 +1393,10 @@ mod tests {
                     .signature(),
                 &tx3.signatures[0]
             );
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                third_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(third_batch.sanitized_transactions, vec![]);
 
-            let fourth_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let fourth_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(fourth_batch.sanitized_transactions.len(), 1);
             assert_eq!(
                 fourth_batch
@@ -1438,11 +1406,8 @@ mod tests {
                     .signature(),
                 &tx4.signatures[0]
             );
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                fourth_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(fourth_batch.sanitized_transactions, vec![]);
         }
 
         drop(tx_sender);
@@ -1471,6 +1436,7 @@ mod tests {
             exit.clone(),
             cost_model,
         );
+        let tx_handle = scheduler.get_handle(SchedulerStage::Transactions);
 
         {
             // 300: A, B, C
@@ -1514,8 +1480,7 @@ mod tests {
 
             send_transactions(&[&tx1, &tx2, &tx3, &tx4], &tx_sender);
 
-            let first_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let first_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(first_batch.sanitized_transactions.len(), 2);
             assert_eq!(
                 first_batch
@@ -1533,14 +1498,10 @@ mod tests {
                     .signature(),
                 &tx3.signatures[0]
             );
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                first_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(first_batch.sanitized_transactions, vec![]);
 
-            let second_batch =
-                scheduler.request_batch(SchedulerStage::Transactions, BATCH_SIZE, &bank);
+            let second_batch = tx_handle.request_batch(BATCH_SIZE, &bank);
             assert_eq!(second_batch.sanitized_transactions.len(), 2);
             assert_eq!(
                 second_batch
@@ -1558,11 +1519,8 @@ mod tests {
                     .signature(),
                 &tx4.signatures[0]
             );
-            let _ = scheduler.send_batch_execution_update(
-                SchedulerStage::Transactions,
-                second_batch.sanitized_transactions,
-                vec![],
-            );
+            let _ =
+                tx_handle.send_batch_execution_update(second_batch.sanitized_transactions, vec![]);
         }
 
         drop(tx_sender);

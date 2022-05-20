@@ -98,6 +98,7 @@ fn bench_consume_buffered(bencher: &mut Bencher) {
                 &QosService::new(Arc::new(RwLock::new(CostModel::default())), 1),
                 &mut LeaderSlotMetricsTracker::new(0),
                 10,
+                ,
             );
         });
 
