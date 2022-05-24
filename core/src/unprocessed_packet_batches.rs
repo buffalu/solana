@@ -42,6 +42,7 @@ pub struct ImmutableDeserializedPacket {
     message_hash: Hash,
     is_simple_vote: bool,
     priority: u64,
+    stamp: Instant,
 }
 
 impl ImmutableDeserializedPacket {
@@ -111,6 +112,7 @@ impl DeserializedPacket {
                 message_hash,
                 is_simple_vote,
                 priority,
+                stamp: Instant::now(),
             }),
             forwarded: false,
         })
@@ -134,10 +136,16 @@ impl Ord for DeserializedPacket {
             .priority()
             .cmp(&self.immutable_section().priority())
         {
-            Ordering::Equal => other
-                .immutable_section()
-                .sender_stake()
-                .cmp(&self.immutable_section().sender_stake()),
+            Ordering::Equal => {
+                other
+                    .immutable_section
+                    .stamp
+                    .cmp(&self.immutable_section.stamp)
+                // match other
+                //     .immutable_section()
+                //     .sender_stake()
+                //     .cmp(&self.immutable_section().sender_stake()) {}
+            }
             ordering => ordering,
         }
     }
@@ -152,7 +160,7 @@ impl PartialOrd for ImmutableDeserializedPacket {
 impl Ord for ImmutableDeserializedPacket {
     fn cmp(&self, other: &Self) -> Ordering {
         match self.priority().cmp(&other.priority()) {
-            Ordering::Equal => self.sender_stake().cmp(&other.sender_stake()),
+            Ordering::Equal => other.stamp.cmp(&self.stamp),
             ordering => ordering,
         }
     }

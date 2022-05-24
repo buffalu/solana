@@ -194,13 +194,13 @@ impl Eq for AccountLocksHeap {}
 
 impl PartialEq<Self> for AccountLocksHeap {
     fn eq(&self, other: &Self) -> bool {
-        return true;
+        self.pubkey == other.pubkey && self.highest_priority_packet == other.highest_priority_packet
     }
 }
 
 impl PartialOrd<Self> for AccountLocksHeap {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        return Some(std::cmp::Ordering::Equal);
+        return Some(self.cmp(other));
     }
 }
 
@@ -212,7 +212,7 @@ impl Ord for AccountLocksHeap {
             .priority()
             .cmp(&other_highest_priority_packet.priority())
         {
-            std::cmp::Ordering::Equal => std::cmp::Ordering::Equal,
+            std::cmp::Ordering::Equal => self.pubkey.cmp(&other.pubkey),
             ordering => ordering,
         }
     }
@@ -451,6 +451,7 @@ impl TransactionScheduler {
                                     // } else {
                                     //     Self::handle_scheduler_request(&mut unprocessed_packet_batches, &scheduled_accounts, batch_request, &qos_service, &config);
                                     // }
+                                    Self::handle_scheduler_request(&mut accounts_heaps, &mut prioritized_heap, &scheduled_accounts, batch_request, &qos_service, &config);
                                 }
                                 Err(_) => {
                                     break;
@@ -762,7 +763,8 @@ impl TransactionScheduler {
     }
 
     fn get_scheduled_batch(
-        unprocessed_packets: &mut UnprocessedPackets,
+        accounts_heaps: &mut HashMap<Pubkey, Rc<RefCell<AccountLocksHeap>>>,
+        prioritized_heap: &mut BTreeSet<Rc<RefCell<AccountLocksHeap>>>,
         scheduled_accounts: &Arc<Mutex<AccountLocks>>,
         num_txs: usize,
         bank: &Arc<Bank>,
@@ -788,7 +790,8 @@ impl TransactionScheduler {
 
     /// Handles scheduler requests and sends back a response over the channel
     fn handle_scheduler_request(
-        unprocessed_packets: &mut UnprocessedPackets,
+        accounts_heaps: &mut HashMap<Pubkey, Rc<RefCell<AccountLocksHeap>>>,
+        prioritized_heap: &mut BTreeSet<Rc<RefCell<AccountLocksHeap>>>,
         scheduled_accounts: &Arc<Mutex<AccountLocks>>,
         scheduler_request: SchedulerRequest,
         qos_service: &QosService,
@@ -800,7 +803,8 @@ impl TransactionScheduler {
                 debug!("SchedulerMessage::RequestBatch num_txs: {}", num_txs);
                 let start = Instant::now();
                 let (sanitized_transactions, packets_to_remove) = Self::get_scheduled_batch(
-                    unprocessed_packets,
+                    accounts_heaps,
+                    prioritized_heap,
                     scheduled_accounts,
                     num_txs,
                     &bank,
@@ -808,9 +812,8 @@ impl TransactionScheduler {
                     config,
                 );
                 debug!(
-                    "sanitized_transactions num: {}, unprocessed_packets num: {}, elapsed: {:?}",
+                    "sanitized_transactions num: {}, elapsed: {:?}",
                     sanitized_transactions.len(),
-                    unprocessed_packets.len(),
                     start.elapsed()
                 );
 
@@ -819,9 +822,6 @@ impl TransactionScheduler {
                         sanitized_transactions,
                     }))
                     .unwrap();
-                for p in packets_to_remove {
-                    unprocessed_packets.remove(&p);
-                }
             }
             SchedulerMessage::Ping { id } => {
                 let _ = response_sender
@@ -967,6 +967,8 @@ impl TransactionScheduler {
         // stored popped account heaps in here and push them back onto the BTreeSet at the end
         let mut popped_heaps: HashMap<Pubkey, Rc<RefCell<AccountLocksHeap>>> = HashMap::new();
 
+        let start = Instant::now();
+        let mut num_inserted = 0;
         for packet_batch in packet_batches {
             let packet_indexes: Vec<_> = packet_batch
                 .packets
@@ -974,6 +976,7 @@ impl TransactionScheduler {
                 .enumerate()
                 .filter_map(|(idx, p)| if !p.meta.discard() { Some(idx) } else { None })
                 .collect();
+            num_inserted += packet_indexes.len();
 
             let root_bank = bank_forks.read().unwrap().root_bank();
             for p in unprocessed_packet_batches::deserialize_packets(&packet_batch, &packet_indexes)
@@ -987,7 +990,6 @@ impl TransactionScheduler {
                 ) {
                     if let Ok(locks) = sanitized_tx.get_account_locks(&root_bank.feature_set) {
                         for a in locks.readonly {
-                            // check to see if this account already has a heap
                             if let Some(heap) = accounts_heaps.get(a) {
                                 // if it's in the popped heaps, we can modify directly
                                 if popped_heaps.contains_key(a) {
@@ -997,8 +999,14 @@ impl TransactionScheduler {
                                     // NOTE: priorities of items inside heap can't be changed, so
                                     // we need to find + pop it off the heap before modifying it directly
                                     // prioritized_heap items can't have items change while inserted, so need to pop it off, add packet, then add to popped heaps
+                                    assert!(prioritized_heap.remove(heap));
+                                    heap.borrow_mut()
+                                        .insert_read_packet(immutable_packet.clone());
+                                    popped_heaps.insert(*a, heap.clone());
                                 }
                             } else {
+                                // first tx for this account, create a new heap and track it in all heaps `accounts_heaps` and popped_heaps
+                                // since we might need to add another packet reference to it
                                 let mut heap = Rc::new(RefCell::new(AccountLocksHeap::new(*a)));
                                 heap.borrow_mut()
                                     .insert_read_packet(immutable_packet.clone());
@@ -1012,6 +1020,14 @@ impl TransactionScheduler {
                 }
             }
         }
+
+        let elapsed = start.elapsed();
+        info!(
+            "num_inserted: {} elapsed: {:?} inserts/s: {:.2}",
+            num_inserted,
+            elapsed,
+            num_inserted as f64 / elapsed.as_secs_f64()
+        );
 
         for (_, heap) in popped_heaps {
             prioritized_heap.insert(heap);
