@@ -4,6 +4,9 @@
 //! - Gossip vote transactions
 
 use solana_runtime::bank_forks::BankForks;
+use solana_runtime::contains::Contains;
+use std::cell::RefCell;
+use std::cmp::max;
 use std::collections::BTreeMap;
 use {
     crate::{
@@ -140,14 +143,79 @@ pub type Result<T> = std::result::Result<T, SchedulerError>;
 
 type UnprocessedPackets = BTreeSet<DeserializedPacket>;
 
-struct AccountLocksHeap {
-    // sorted list of immutable packets
-    pub packets: BTreeSet<Rc<ImmutableDeserializedPacket>>,
+enum LockType {
+    Read,
+    Write,
 }
 
-struct PubkeyAndPriority {
-    pub pubkey: Pubkey,
-    pub highest_priority: u64,
+struct AccountLocksHeap {
+    pubkey: Pubkey,
+
+    read_heap_packets: BTreeSet<Rc<ImmutableDeserializedPacket>>,
+    write_heap_packets: BTreeSet<Rc<ImmutableDeserializedPacket>>,
+
+    highest_priority_packet: Option<Rc<ImmutableDeserializedPacket>>,
+}
+
+impl AccountLocksHeap {
+    pub fn new(pubkey: Pubkey) -> Self {
+        AccountLocksHeap {
+            pubkey,
+            read_heap_packets: BTreeSet::new(),
+            write_heap_packets: BTreeSet::new(),
+            highest_priority_packet: None,
+        }
+    }
+
+    pub fn insert_write_packet(&mut self, packet: Rc<ImmutableDeserializedPacket>) {
+        assert!(self.write_heap_packets.insert(packet.clone()));
+        if self.highest_priority_packet.is_none()
+            || packet.priority() > self.highest_priority_packet.as_ref().unwrap().priority()
+        {
+            self.highest_priority_packet = Some(packet);
+        }
+    }
+
+    pub fn insert_read_packet(&mut self, packet: Rc<ImmutableDeserializedPacket>) {
+        assert!(self.read_heap_packets.insert(packet.clone()));
+        if self.highest_priority_packet.is_none()
+            || packet.priority() > self.highest_priority_packet.as_ref().unwrap().priority()
+        {
+            self.highest_priority_packet = Some(packet);
+        }
+    }
+
+    pub fn highest_priority_packet(&self) -> Option<Rc<ImmutableDeserializedPacket>> {
+        self.highest_priority_packet.clone()
+    }
+}
+
+impl Eq for AccountLocksHeap {}
+
+impl PartialEq<Self> for AccountLocksHeap {
+    fn eq(&self, other: &Self) -> bool {
+        return true;
+    }
+}
+
+impl PartialOrd<Self> for AccountLocksHeap {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        return Some(std::cmp::Ordering::Equal);
+    }
+}
+
+impl Ord for AccountLocksHeap {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let my_highest_priority_packet = self.highest_priority_packet().unwrap();
+        let other_highest_priority_packet = other.highest_priority_packet().unwrap();
+        match my_highest_priority_packet
+            .priority()
+            .cmp(&other_highest_priority_packet.priority())
+        {
+            std::cmp::Ordering::Equal => std::cmp::Ordering::Equal,
+            ordering => ordering,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -342,14 +410,11 @@ impl TransactionScheduler {
             .spawn(move || {
                 let mut last_log = Instant::now();
 
-                // need to map pubkey -> priority for easy lookup in btree
-                let mut pubkey_to_highest_priority: HashMap<Pubkey, u64> = HashMap::new();
-
-                let mut unblocked_read_accounts: BTreeMap<PubkeyAndPriority, AccountLocksHeap> = BTreeMap::new();
-                let mut unblocked_write_accounts: BTreeMap<PubkeyAndPriority, AccountLocksHeap> = BTreeMap::new();
-
-                let mut blocked_read_accounts: BTreeMap<PubkeyAndPriority, AccountLocksHeap> = BTreeMap::new();
-                let mut blocked_write_accounts: BTreeMap<PubkeyAndPriority, AccountLocksHeap> = BTreeMap::new();
+                // tracks all account heaps for easy lookup
+                let mut accounts_heaps: HashMap<Pubkey, Rc<RefCell<AccountLocksHeap>>> = HashMap::new();
+                // tracks prioritized account heaps
+                // NOTE: any changes to accounts_heaps requires that entry to be popped from the BTreeSet
+                let mut prioritized_heap: BTreeSet<Rc<RefCell<AccountLocksHeap>>> = BTreeSet::new();
 
                 loop {
                     if exit.load(Ordering::Relaxed) {
@@ -364,7 +429,7 @@ impl TransactionScheduler {
                         recv(packet_receiver) -> maybe_packet_batches => {
                             match maybe_packet_batches {
                                 Ok(packet_batches) => {
-                                    Self::handle_packet_batches(&mut unblocked_read_accounts, &mut unblocked_write_accounts,&mut blocked_read_accounts, &mut blocked_write_accounts, &mut pubkey_to_highest_priority, packet_batches, &bank_forks);
+                                    Self::handle_packet_batches(&mut accounts_heaps, &mut prioritized_heap, packet_batches, &bank_forks);
 
                                     // drain the blocked requests until there's packets
                                     // while !blocked_batch_requests.is_empty() && !unprocessed_packet_batches.is_empty() {
@@ -894,14 +959,14 @@ impl TransactionScheduler {
     }
 
     fn handle_packet_batches(
-        unblocked_read_accounts: &mut BTreeMap<PubkeyAndPriority, AccountLocksHeap>,
-        unblocked_write_accounts: &mut BTreeMap<PubkeyAndPriority, AccountLocksHeap>,
-        blocked_read_accounts: &mut BTreeMap<PubkeyAndPriority, AccountLocksHeap>,
-        blocked_write_accounts: &mut BTreeMap<PubkeyAndPriority, AccountLocksHeap>,
-        pubkey_to_highest_priority: &mut HashMap<Pubkey, u64>,
+        accounts_heaps: &mut HashMap<Pubkey, Rc<RefCell<AccountLocksHeap>>>,
+        prioritized_heap: &mut BTreeSet<Rc<RefCell<AccountLocksHeap>>>,
         packet_batches: Vec<PacketBatch>,
         bank_forks: &Arc<RwLock<BankForks>>,
     ) {
+        // stored popped account heaps in here and push them back onto the BTreeSet at the end
+        let mut popped_heaps: HashMap<Pubkey, Rc<RefCell<AccountLocksHeap>>> = HashMap::new();
+
         for packet_batch in packet_batches {
             let packet_indexes: Vec<_> = packet_batch
                 .packets
@@ -921,10 +986,34 @@ impl TransactionScheduler {
                     root_bank.as_ref(),
                 ) {
                     if let Ok(locks) = sanitized_tx.get_account_locks(&root_bank.feature_set) {
-                        // insert into all of the account locks heaps
+                        for a in locks.readonly {
+                            // check to see if this account already has a heap
+                            if let Some(heap) = accounts_heaps.get(a) {
+                                // if it's in the popped heaps, we can modify directly
+                                if popped_heaps.contains_key(a) {
+                                    heap.borrow_mut()
+                                        .insert_read_packet(immutable_packet.clone());
+                                } else {
+                                    // look at docs
+                                    // prioritized_heap items can't have items change while inserted, so need to pop it off, add packet, then add to popped heaps
+                                }
+                            } else {
+                                let mut heap = Rc::new(RefCell::new(AccountLocksHeap::new(*a)));
+                                heap.borrow_mut()
+                                    .insert_read_packet(immutable_packet.clone());
+
+                                // track this heap in the global account heaps and assume popped for now since all popped heaps added on at the end
+                                accounts_heaps.insert(*a, heap.clone());
+                                popped_heaps.insert(*a, heap.clone());
+                            }
+                        }
                     }
                 }
             }
+        }
+
+        for (_, heap) in popped_heaps {
+            prioritized_heap.insert(heap);
         }
     }
 
