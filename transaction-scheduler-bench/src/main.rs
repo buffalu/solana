@@ -87,6 +87,16 @@ struct SchedulerBench {
 }
 
 fn configure_scheduler_bench(config: TransactionSchedulerConfig) -> SchedulerBench {
+    let mint_total = 1_000_000_000_000;
+    let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(mint_total);
+
+    let bank0 = Bank::new_for_benches(&genesis_config);
+    let bank_forks = BankForks::new(bank0);
+    let bank = bank_forks.working_bank();
+    bank.write_cost_tracker()
+        .unwrap()
+        .set_limits(u64::MAX, u64::MAX, u64::MAX);
+
     let (tx_sender, tx_receiver) = unbounded();
     let (tpu_vote_sender, tpu_vote_receiver) = unbounded();
     let (gossip_vote_sender, gossip_vote_receiver) = unbounded();
@@ -100,16 +110,8 @@ fn configure_scheduler_bench(config: TransactionSchedulerConfig) -> SchedulerBen
         exit.clone(),
         cost_model,
         config,
+        &Arc::new(RwLock::new(bank_forks)),
     );
-    let mint_total = 1_000_000_000_000;
-    let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(mint_total);
-
-    let bank0 = Bank::new_for_benches(&genesis_config);
-    let bank_forks = BankForks::new(bank0);
-    let bank = bank_forks.working_bank();
-    bank.write_cost_tracker()
-        .unwrap()
-        .set_limits(u64::MAX, u64::MAX, u64::MAX);
 
     SchedulerBench {
         tx_sender,

@@ -3,6 +3,8 @@
 //! - TPU vote transactions
 //! - Gossip vote transactions
 
+use solana_runtime::bank_forks::BankForks;
+use std::collections::BTreeMap;
 use {
     crate::{
         banking_stage::BatchedTransactionDetails,
@@ -138,6 +140,16 @@ pub type Result<T> = std::result::Result<T, SchedulerError>;
 
 type UnprocessedPackets = BTreeSet<DeserializedPacket>;
 
+struct AccountLocksHeap {
+    // sorted list of immutable packets
+    pub packets: BTreeSet<Rc<ImmutableDeserializedPacket>>,
+}
+
+struct PubkeyAndPriority {
+    pub pubkey: Pubkey,
+    pub highest_priority: u64,
+}
+
 #[derive(Clone)]
 pub struct TransactionSchedulerHandle {
     sender: Sender<SchedulerRequest>,
@@ -239,6 +251,7 @@ impl TransactionScheduler {
         exit: Arc<AtomicBool>,
         cost_model: Arc<RwLock<CostModel>>,
         config: TransactionSchedulerConfig,
+        bank_forks: &Arc<RwLock<BankForks>>,
     ) -> Self {
         let scheduled_accounts = Arc::new(Mutex::new(AccountLocks::default()));
 
@@ -251,6 +264,7 @@ impl TransactionScheduler {
             QosService::new(cost_model.clone(), 0),
             &exit,
             config.clone(),
+            bank_forks.clone(),
         );
 
         let (tpu_vote_scheduler_request_sender, tpu_vote_scheduler_request_receiver) = unbounded();
@@ -262,6 +276,7 @@ impl TransactionScheduler {
             QosService::new(cost_model.clone(), 1),
             &exit,
             config.clone(),
+            bank_forks.clone(),
         );
 
         let (gossip_vote_scheduler_request_sender, gossip_vote_scheduler_request_receiver) =
@@ -274,6 +289,7 @@ impl TransactionScheduler {
             QosService::new(cost_model.clone(), 2),
             &exit,
             config.clone(),
+            bank_forks.clone(),
         );
 
         TransactionScheduler {
@@ -318,36 +334,43 @@ impl TransactionScheduler {
         qos_service: QosService,
         exit: &Arc<AtomicBool>,
         config: TransactionSchedulerConfig,
+        bank_forks: Arc<RwLock<BankForks>>,
     ) -> JoinHandle<()> {
         let exit = exit.clone();
         Builder::new()
             .name(t_name.to_string())
             .spawn(move || {
-                // NOTE: the keys on the BTreeSet need to be unique
-                let mut unprocessed_packet_batches = BTreeSet::new();
-
                 let mut last_log = Instant::now();
 
-                let mut blocked_batch_requests = Vec::new();
+                // need to map pubkey -> priority for easy lookup in btree
+                let mut pubkey_to_highest_priority: HashMap<Pubkey, u64> = HashMap::new();
+
+                let mut unblocked_read_accounts: BTreeMap<PubkeyAndPriority, AccountLocksHeap> = BTreeMap::new();
+                let mut unblocked_write_accounts: BTreeMap<PubkeyAndPriority, AccountLocksHeap> = BTreeMap::new();
+
+                let mut blocked_read_accounts: BTreeMap<PubkeyAndPriority, AccountLocksHeap> = BTreeMap::new();
+                let mut blocked_write_accounts: BTreeMap<PubkeyAndPriority, AccountLocksHeap> = BTreeMap::new();
 
                 loop {
                     if exit.load(Ordering::Relaxed) {
                         break;
                     }
                     if last_log.elapsed() > Duration::from_secs(1) {
-                        let num_packets = unprocessed_packet_batches.len();
-                        info!("num_packets: {}", num_packets);
-                        last_log = Instant::now();
+                        // let num_packets = unprocessed_packet_batches.len();
+                        // info!("num_packets: {}", num_packets);
+                        // last_log = Instant::now();
                     }
                     select! {
                         recv(packet_receiver) -> maybe_packet_batches => {
                             match maybe_packet_batches {
                                 Ok(packet_batches) => {
-                                    Self::handle_packet_batches(&mut unprocessed_packet_batches, packet_batches);
-                                    while !blocked_batch_requests.is_empty() && !unprocessed_packet_batches.is_empty() {
-                                        let request = blocked_batch_requests.pop().unwrap();
-                                        Self::handle_scheduler_request(&mut unprocessed_packet_batches, &scheduled_accounts, request, &qos_service, &config);
-                                    }
+                                    Self::handle_packet_batches(&mut unblocked_read_accounts, &mut unblocked_write_accounts,&mut blocked_read_accounts, &mut blocked_write_accounts, &mut pubkey_to_highest_priority, packet_batches, &bank_forks);
+
+                                    // drain the blocked requests until there's packets
+                                    // while !blocked_batch_requests.is_empty() && !unprocessed_packet_batches.is_empty() {
+                                    //     let request = blocked_batch_requests.pop().unwrap();
+                                    //     Self::handle_scheduler_request(&mut unprocessed_packet_batches, &scheduled_accounts, request, &qos_service, &config);
+                                    // }
                                 }
                                 Err(_) => {
                                     break;
@@ -358,11 +381,11 @@ impl TransactionScheduler {
                             match maybe_batch_request {
                                 Ok(batch_request) => {
                                     // safe the request until there's more packets
-                                    if unprocessed_packet_batches.is_empty() && matches!(batch_request.msg, SchedulerMessage::RequestBatch{num_txs: _, bank: _}) {
-                                        blocked_batch_requests.push(batch_request);
-                                    } else {
-                                        Self::handle_scheduler_request(&mut unprocessed_packet_batches, &scheduled_accounts, batch_request, &qos_service, &config);
-                                    }
+                                    // if unprocessed_packet_batches.is_empty() && matches!(batch_request.msg, SchedulerMessage::RequestBatch{num_txs: _, bank: _}) {
+                                    //     blocked_batch_requests.push(batch_request);
+                                    // } else {
+                                    //     Self::handle_scheduler_request(&mut unprocessed_packet_batches, &scheduled_accounts, batch_request, &qos_service, &config);
+                                    // }
                                 }
                                 Err(_) => {
                                     break;
@@ -681,44 +704,21 @@ impl TransactionScheduler {
         qos_service: &QosService,
         config: &TransactionSchedulerConfig,
     ) -> (Vec<SanitizedTransaction>, Vec<DeserializedPacket>) {
-        // hashmap representing the highest fee of currently write-locked and read-locked blocked accounts
-        // almost a pseudo AccountLocks but fees instead of hashset/read lock count
-        let mut highest_wl_blocked_account_fees = HashMap::with_capacity(10_000);
-        let mut highest_rl_blocked_account_fees = HashMap::with_capacity(10_000);
+        // separate read and write heap for each account that takes Rc<Packet> or something similar
+        // AccountHeaps has max_read_lock_fee and max_write_lock_fee traits to them.
+        // AccountHeaps are put into a heap of account heaps. this heap is ordered by max(read lock fee, write lock fee).
+        // pop max account heap from AccountHeaps.
+        //     Peak max(read_lock_queue, write_lock_queue) tx in the heap
+        //     for acc in tx.accounts:
+        //         check to see if tx can be scheduled by currently locked transactions
+        //         what if it cant?
+        //     if it can be scheduled, add to sanitized txs. also add all other accounts to blocked accounts (maybe signal if totally blocked or read-only allowed?).
+        //     if it was a read-locked account, insert back onto heap to be sorted
+        //     if it was a write-locked account, hold off the heap until the end bc none of those txs will ever get scheduled.
+        //
+        // can keep blocked accounts on separate heap until account locks are free?
 
-        let mut sanitized_transactions = Vec::with_capacity(num_txs);
-        let mut packets_to_remove = vec![];
-        for deserialized_packet in unprocessed_packets.iter() {
-            if sanitized_transactions.len() >= num_txs {
-                break; // if fully-scheduled, retain rest of packets
-            }
-            match Self::try_schedule(
-                deserialized_packet.immutable_section(),
-                bank,
-                &mut highest_wl_blocked_account_fees,
-                &mut highest_rl_blocked_account_fees,
-                scheduled_accounts,
-                qos_service,
-                config,
-            ) {
-                Ok(sanitized_tx) => {
-                    sanitized_transactions.push(sanitized_tx);
-                    packets_to_remove.push(deserialized_packet.clone());
-                }
-                Err(e) => {
-                    trace!("e: {:?}", e);
-                    match e {
-                        SchedulerError::InvalidSanitizedTransaction
-                        | SchedulerError::InvalidTransactionFormat(_)
-                        | SchedulerError::TransactionCheckFailed(_) => {}
-                        SchedulerError::AccountInUse
-                        | SchedulerError::AccountBlocked(_)
-                        | SchedulerError::QosExceeded => {}
-                    }
-                }
-            }
-        }
-        (sanitized_transactions, packets_to_remove)
+        (vec![], vec![])
     }
 
     /// Handles scheduler requests and sends back a response over the channel
@@ -894,8 +894,13 @@ impl TransactionScheduler {
     }
 
     fn handle_packet_batches(
-        unprocessed_packets: &mut UnprocessedPackets,
+        unblocked_read_accounts: &mut BTreeMap<PubkeyAndPriority, AccountLocksHeap>,
+        unblocked_write_accounts: &mut BTreeMap<PubkeyAndPriority, AccountLocksHeap>,
+        blocked_read_accounts: &mut BTreeMap<PubkeyAndPriority, AccountLocksHeap>,
+        blocked_write_accounts: &mut BTreeMap<PubkeyAndPriority, AccountLocksHeap>,
+        pubkey_to_highest_priority: &mut HashMap<Pubkey, u64>,
         packet_batches: Vec<PacketBatch>,
+        bank_forks: &Arc<RwLock<BankForks>>,
     ) {
         for packet_batch in packet_batches {
             let packet_indexes: Vec<_> = packet_batch
@@ -905,10 +910,21 @@ impl TransactionScheduler {
                 .filter_map(|(idx, p)| if !p.meta.discard() { Some(idx) } else { None })
                 .collect();
 
-            unprocessed_packets.extend(unprocessed_packet_batches::deserialize_packets(
-                &packet_batch,
-                &packet_indexes,
-            ));
+            let root_bank = bank_forks.read().unwrap().root_bank();
+            for p in unprocessed_packet_batches::deserialize_packets(&packet_batch, &packet_indexes)
+            {
+                let immutable_packet = p.immutable_section();
+                if let Some(sanitized_tx) = Self::transaction_from_deserialized_packet(
+                    &immutable_packet,
+                    &root_bank.feature_set,
+                    root_bank.vote_only_bank(),
+                    root_bank.as_ref(),
+                ) {
+                    if let Ok(locks) = sanitized_tx.get_account_locks(&root_bank.feature_set) {
+                        // insert into all of the account locks heaps
+                    }
+                }
+            }
         }
     }
 

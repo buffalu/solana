@@ -76,7 +76,6 @@ impl ImmutableDeserializedPacket {
 pub struct DeserializedPacket {
     immutable_section: Rc<ImmutableDeserializedPacket>,
     pub forwarded: bool,
-    pub stamp: Instant,
 }
 
 impl DeserializedPacket {
@@ -114,7 +113,6 @@ impl DeserializedPacket {
                 priority,
             }),
             forwarded: false,
-            stamp: Instant::now(),
         })
     }
 
@@ -136,14 +134,10 @@ impl Ord for DeserializedPacket {
             .priority()
             .cmp(&self.immutable_section().priority())
         {
-            Ordering::Equal => {
-                // priority high-to-low, time low-to-high
-                self.stamp.cmp(&other.stamp)
-                // self
-                //     .immutable_section()
-                //     .sender_stake()
-                //     .cmp(&other.immutable_section().sender_stake())
-            }
+            Ordering::Equal => other
+                .immutable_section()
+                .sender_stake()
+                .cmp(&self.immutable_section().sender_stake()),
             ordering => ordering,
         }
     }
