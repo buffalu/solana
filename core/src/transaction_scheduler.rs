@@ -798,13 +798,14 @@ impl TransactionScheduler {
         config: &TransactionSchedulerConfig,
     ) {
         let response_sender = scheduler_request.response_sender;
+        let mut prioritized_heap = BTreeSet::new();
         match scheduler_request.msg {
             SchedulerMessage::RequestBatch { num_txs, bank } => {
                 debug!("SchedulerMessage::RequestBatch num_txs: {}", num_txs);
                 let start = Instant::now();
                 let (sanitized_transactions, packets_to_remove) = Self::get_scheduled_batch(
                     accounts_heaps,
-                    prioritized_heap,
+                    &mut prioritized_heap,
                     scheduled_accounts,
                     num_txs,
                     &bank,
@@ -964,11 +965,13 @@ impl TransactionScheduler {
         packet_batches: Vec<PacketBatch>,
         bank_forks: &Arc<RwLock<BankForks>>,
     ) {
-        // stored popped account heaps in here and push them back onto the BTreeSet at the end
-        let mut popped_heaps: HashMap<Pubkey, Rc<RefCell<AccountLocksHeap>>> = HashMap::new();
+        let mut popped_heaps = HashMap::new();
+        let root_bank = bank_forks.read().unwrap().root_bank();
 
+        // stored popped account heaps in here and push them back onto the BTreeSet at the end
         let start = Instant::now();
         let mut num_inserted = 0;
+
         for packet_batch in packet_batches {
             let packet_indexes: Vec<_> = packet_batch
                 .packets
@@ -977,8 +980,6 @@ impl TransactionScheduler {
                 .filter_map(|(idx, p)| if !p.meta.discard() { Some(idx) } else { None })
                 .collect();
             num_inserted += packet_indexes.len();
-
-            let root_bank = bank_forks.read().unwrap().root_bank();
             for p in unprocessed_packet_batches::deserialize_packets(&packet_batch, &packet_indexes)
             {
                 let immutable_packet = p.immutable_section();
@@ -1019,7 +1020,6 @@ impl TransactionScheduler {
 
                         for a in locks.writable {
                             if let Some(heap) = accounts_heaps.get(a) {
-                                // if it's in the popped heaps, we can modify directly
                                 if popped_heaps.contains_key(a) {
                                     heap.borrow_mut()
                                         .insert_write_packet(immutable_packet.clone());
@@ -1049,17 +1049,22 @@ impl TransactionScheduler {
             }
         }
 
+        let now = Instant::now();
+        // push all the updated heaps on
+        for (_, h) in popped_heaps {
+            assert!(prioritized_heap.insert(h));
+        }
+        let heap_push_elapsed = now.elapsed();
+
         let elapsed = start.elapsed();
         info!(
-            "num_inserted: {} elapsed: {:?} inserts/s: {:.2}",
+            "num_inserted: {} elapsed: {:?} inserts/s: {:.2} insert time: {:.2}us heap_push_elapsed: {:?}",
             num_inserted,
             elapsed,
-            num_inserted as f64 / elapsed.as_secs_f64()
+            num_inserted as f64 / elapsed.as_secs_f64(),
+            elapsed.as_micros() / num_inserted as u128,
+            heap_push_elapsed
         );
-
-        for (_, heap) in popped_heaps {
-            prioritized_heap.insert(heap);
-        }
     }
 
     /// Returns sending side of the channel given the scheduler stage
