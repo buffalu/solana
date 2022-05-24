@@ -1016,6 +1016,34 @@ impl TransactionScheduler {
                                 popped_heaps.insert(*a, heap.clone());
                             }
                         }
+
+                        for a in locks.writable {
+                            if let Some(heap) = accounts_heaps.get(a) {
+                                // if it's in the popped heaps, we can modify directly
+                                if popped_heaps.contains_key(a) {
+                                    heap.borrow_mut()
+                                        .insert_write_packet(immutable_packet.clone());
+                                } else {
+                                    // NOTE: priorities of items inside heap can't be changed, so
+                                    // we need to find + pop it off the heap before modifying it directly
+                                    // prioritized_heap items can't have items change while inserted, so need to pop it off, add packet, then add to popped heaps
+                                    assert!(prioritized_heap.remove(heap));
+                                    heap.borrow_mut()
+                                        .insert_write_packet(immutable_packet.clone());
+                                    popped_heaps.insert(*a, heap.clone());
+                                }
+                            } else {
+                                // first tx for this account, create a new heap and track it in all heaps `accounts_heaps` and popped_heaps
+                                // since we might need to add another packet reference to it
+                                let mut heap = Rc::new(RefCell::new(AccountLocksHeap::new(*a)));
+                                heap.borrow_mut()
+                                    .insert_write_packet(immutable_packet.clone());
+
+                                // track this heap in the global account heaps and assume popped for now since all popped heaps added on at the end
+                                accounts_heaps.insert(*a, heap.clone());
+                                popped_heaps.insert(*a, heap.clone());
+                            }
+                        }
                     }
                 }
             }
