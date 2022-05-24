@@ -994,7 +994,8 @@ impl TransactionScheduler {
                                     heap.borrow_mut()
                                         .insert_read_packet(immutable_packet.clone());
                                 } else {
-                                    // look at docs
+                                    // NOTE: priorities of items inside heap can't be changed, so
+                                    // we need to find + pop it off the heap before modifying it directly
                                     // prioritized_heap items can't have items change while inserted, so need to pop it off, add packet, then add to popped heaps
                                 }
                             } else {
