@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::fs::create_dir_all;
 use tokio::net::UnixListener;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::transport::Server;
 use tonic::{async_trait, Request, Response, Status, Streaming};
@@ -30,7 +31,9 @@ pub enum HookServiceError {
 
 pub type HookServiceResult<T> = Result<T, HookServiceError>;
 
-pub struct HookGrpcService {}
+pub struct HookGrpcService {
+    pub handle: JoinHandle<Result<(), tonic::transport::Error>>,
+}
 
 impl HookGrpcService {
     pub async fn new(uds_path: PathBuf) -> HookServiceResult<Self> {
@@ -46,12 +49,13 @@ impl HookGrpcService {
         let uds = UnixListener::bind(uds_path)?;
         let uds_stream = UnixListenerStream::new(uds);
 
-        Server::builder()
-            .add_service(service)
-            .serve_with_incoming(uds_stream)
-            .await?;
+        let handle = tokio::spawn(
+            Server::builder()
+                .add_service(service)
+                .serve_with_incoming(uds_stream),
+        );
 
-        Ok(HookGrpcService {})
+        Ok(HookGrpcService { handle })
     }
 }
 
