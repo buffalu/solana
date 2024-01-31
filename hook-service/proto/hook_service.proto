@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package hook_service;
+
+message SocketAddress {
+    uint32 ip = 1;
+    uint32 port = 2;
+}
+
+message EnableTpuRequest {
+    // Enable (or disable) packets coming from the TPU QUIC server
+    bool enable_tpu = 1;
+    // Enable (or disable) packets coming from the TPU forward QUIC server
+    bool enable_tpu_fwd = 2;
+}
+
+message EnableTpuResponse {}
+
+message SetTpuAddressRequest {
+    // Sets the TPU socket address in gossip for this validator
+    SocketAddress tpu = 1;
+    // Sets the TPU forward socket address in gossip for this validator
+    SocketAddress tpu_fwd = 2;
+}
+
+message SetTpuAddressResponse {}
+
+message Packet {
+    repeated bytes payload = 1;
+}
+
+message SendPacketsRequest {
+    bool admin = 1;
+    repeated Packet packets = 2;
+}
+
+message SendPacketsResponse {}
+
+message SetShredForwarderAddressRequest {
+    optional SocketAddress broadcast_address = 1;
+    optional SocketAddress retransmit_address = 2;
+}
+
+message SetShredForwarderAddressResponse {}
+
+message SetMaxComputeRequest {
+    uint64 max_compute_units = 1;
+}
+
+message SetMaxComputeResponse {}
+
+message Bundle {
+    bool admin = 1;
+    repeated Packet packets = 2;
+    string uuid = 3;
+}
+
+message SendBundleRequest {
+    repeated Bundle bundles = 1;
+    uint64 slot_expiration = 2;
+}
+
+message SendBundleResponse {}
+
+message MarkAccountsForDiscardRequest {
+    repeated string write_accounts = 1;
+    repeated string read_accounts = 2;
+}
+
+message MarkAccountsForDiscardResponse {}
+
+service HookService {
+    // Enable or disable TPU and TPU forward ports in the validator
+    rpc EnableTpu(EnableTpuRequest) returns (EnableTpuResponse);
+
+    // Set the TPU and TPU forward addresses
+    rpc SetTpuAddress(SetTpuAddressRequest) returns (SetTpuAddressResponse);
+
+    // Sends packets into the BankingStage of the validator
+    rpc SendPackets(stream SendPacketsRequest) returns (SendPacketsResponse);
+
+    // Marks accounts for discard
+    rpc MarkAccountsForDiscard(MarkAccountsForDiscardRequest) returns (MarkAccountsForDiscardResponse);
+
+    // Sets the shred forwarder addresses
+    rpc SetShredForwarderAddress(SetShredForwarderAddressRequest) returns (SetShredForwarderAddressResponse);
+
+    // Sets the max compute for the current slot
+    rpc SetMaxCompute(SetMaxComputeRequest) returns (SetMaxComputeResponse);
+
+    // Sends a bundle stream to the validator
+    rpc SendBundle(stream SendBundleRequest) returns (stream SendBundleResponse);
+}

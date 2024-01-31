@@ -20,6 +20,7 @@ pub mod admin_rpc_service;
 pub mod bootstrap;
 pub mod cli;
 pub mod dashboard;
+pub mod hook_service;
 
 #[cfg(unix)]
 fn redirect_stderr(filename: &str) {

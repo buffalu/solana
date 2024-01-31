@@ -40,6 +40,7 @@ members = [
     "geyser-plugin-interface",
     "geyser-plugin-manager",
     "gossip",
+    "hook-service",
     "install",
     "keygen",
     "ledger",
@@ -331,6 +332,7 @@ solana-core = { path = "core", version = "=1.18.0" }
 solana-cost-model = { path = "cost-model", version = "=1.18.0" }
 solana-download-utils = { path = "download-utils", version = "=1.18.0" }
 solana-entry = { path = "entry", version = "=1.18.0" }
+solana-hook-service-proto = { path = "hook-service", version = "=1.18.0" }
 solana-faucet = { path = "faucet", version = "=1.18.0" }
 solana-frozen-abi = { path = "frozen-abi", version = "=1.18.0" }
 solana-frozen-abi-macro = { path = "frozen-abi/macro", version = "=1.18.0" }

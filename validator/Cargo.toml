@@ -44,6 +44,7 @@ solana-genesis-utils = { workspace = true }
 solana-geyser-plugin-interface = { workspace = true }
 solana-geyser-plugin-manager = { workspace = true }
 solana-gossip = { workspace = true }
+solana-hook-service-proto = { workspace = true }
 solana-ledger = { workspace = true }
 solana-logger = { workspace = true }
 solana-metrics = { workspace = true }
@@ -64,6 +65,9 @@ solana-version = { workspace = true }
 solana-vote-program = { workspace = true }
 symlink = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
 
 [dev-dependencies]
 solana-account-decoder = { workspace = true }
