@@ -40,11 +40,11 @@ solana-core = { workspace = true }
 solana-download-utils = { workspace = true }
 solana-entry = { workspace = true }
 solana-faucet = { workspace = true }
-solana-hook-service-proto = { workspace = true }
 solana-genesis-utils = { workspace = true }
 solana-geyser-plugin-interface = { workspace = true }
 solana-geyser-plugin-manager = { workspace = true }
 solana-gossip = { workspace = true }
+solana-hook-service-proto = { workspace = true }
 solana-ledger = { workspace = true }
 solana-logger = { workspace = true }
 solana-metrics = { workspace = true }
