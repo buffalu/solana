@@ -8,8 +8,9 @@ use solana_hook_service_proto::hook_service::{
     SetShredForwarderAddressRequest, SetShredForwarderAddressResponse, SetTpuAddressRequest,
     SetTpuAddressResponse,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
+use tokio::fs::create_dir_all;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::transport::Server;
@@ -17,6 +18,9 @@ use tonic::{async_trait, Request, Response, Status, Streaming};
 
 #[derive(Debug, Error)]
 pub enum HookServiceError {
+    #[error("UdsPathError")]
+    UdsPathError,
+
     #[error("UdsSetupError: {0}")]
     UdsSetupError(#[from] std::io::Error),
 
@@ -30,6 +34,13 @@ pub struct HookGrpcService {}
 
 impl HookGrpcService {
     pub async fn new(uds_path: PathBuf) -> HookServiceResult<Self> {
+        create_dir_all(
+            Path::new(&uds_path)
+                .parent()
+                .ok_or(HookServiceError::UdsPathError)?,
+        )
+        .await?;
+
         let service = HookServiceServer::new(HookServiceImpl::new());
 
         let uds = UnixListener::bind(uds_path)?;

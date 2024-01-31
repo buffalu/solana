@@ -57,6 +57,7 @@ message Bundle {
 
 message SendBundleRequest {
     repeated Bundle bundles = 1;
+    uint64 slot_expiration = 2;
 }
 
 message SendBundleResponse {}
