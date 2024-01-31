@@ -6225,6 +6225,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-hook-service-proto"
+version = "1.18.0"
+dependencies = [
+ "bincode",
+ "bs58",
+ "enum-iterator",
+ "prost",
+ "protobuf-src",
+ "serde",
+ "solana-account-decoder",
+ "solana-sdk",
+ "solana-transaction-status",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "solana-install"
 version = "1.18.0"
 dependencies = [
@@ -7575,6 +7592,7 @@ dependencies = [
  "solana-geyser-plugin-interface",
  "solana-geyser-plugin-manager",
  "solana-gossip",
+ "solana-hook-service-proto",
  "solana-ledger",
  "solana-logger",
  "solana-metrics",
@@ -7597,6 +7615,9 @@ dependencies = [
  "symlink",
  "thiserror",
  "tikv-jemallocator",
+ "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
